@@ -26,6 +26,8 @@ CLASSIFIER_TIMEOUT = 90
 ANSWER_TIMEOUT = 180
 MAX_HISTORY_MESSAGES = DEFAULT_SETTINGS["max_history_messages"]
 DEFAULT_BACKGROUND_ALPHA = DEFAULT_SETTINGS["background_alpha"]
+DEFAULT_BACKGROUND_SATURATION = DEFAULT_SETTINGS["background_saturation"]
+CLOSE_TO_TRAY = DEFAULT_SETTINGS["close_to_tray"]
 SYSTEM_PROMPT = """
 Ты — локальный русскоязычный ассистент.
 Отвечай естественно, понятно и по существу, как в обычном чате.
