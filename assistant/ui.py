@@ -14,7 +14,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
-    QSyntaxHighlighter, QTextCharFormat,
+    QSyntaxHighlighter, QTextCharFormat, QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .audio_worker import AudioWorker
+from .chat_input import ChatInput
 from .config import (
     DEFAULT_BACKGROUND_ALPHA,
     DEFAULT_BACKGROUND_SATURATION,
@@ -35,7 +36,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r8"
+BUILD_VERSION = "2026.10.21-r9"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -163,7 +164,7 @@ QPushButton#listenButton[active="false"] {
     border-color: rgba(240, 195, 110, 55);
 }
 
-QLineEdit {
+QLineEdit, QPlainTextEdit {
     color: #F4F5FF;
     background-color: rgba(9, 11, 18, 170);
     border: 1px solid rgba(171, 183, 231, 45);
@@ -172,7 +173,7 @@ QLineEdit {
     selection-background-color: #667CE0;
 }
 
-QLineEdit:focus {
+QLineEdit:focus, QPlainTextEdit:focus {
     border-color: rgba(150, 165, 255, 145);
     background-color: rgba(10, 12, 21, 220);
 }
@@ -844,6 +845,7 @@ class TypingBubble(QFrame):
 class AssistantWindow(QWidget):
     hotkey_toggle_signal = Signal()
     hotkey_set_listening_signal = Signal(bool)
+    hotkey_show_window_signal = Signal()
 
     def __init__(self):
         super().__init__()
@@ -875,6 +877,7 @@ class AssistantWindow(QWidget):
         self._exit_requested = False
         self._hotkey_registered = False
         self._hotkey_handles: list[Any] = []
+        self._window_shortcuts: list[QShortcut] = []
         self._drag_position = None
         self.tray_icon: QSystemTrayIcon | None = None
         self.tray_menu: QMenu | None = None
@@ -895,6 +898,7 @@ class AssistantWindow(QWidget):
         self.setMinimumSize(430, 540)
 
         self._build_ui()
+        self._register_window_shortcuts()
         self._apply_background_alpha()
 
         self.audio = AudioWorker(self.settings_store)
@@ -1084,10 +1088,8 @@ class AssistantWindow(QWidget):
         composer = QHBoxLayout()
         composer.setSpacing(8)
 
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Напишите сообщение…")
-        self.input.setMinimumHeight(46)
-        self.input.returnPressed.connect(self._send_typed_message)
+        self.input = ChatInput()
+        self.input.send_requested.connect(self._send_typed_message)
 
         self.send_button = IconButton(
             "send",
@@ -1158,36 +1160,108 @@ class AssistantWindow(QWidget):
 
         self.hotkey_toggle_signal.connect(self.toggle_listening)
         self.hotkey_set_listening_signal.connect(self._set_listening_from_hotkey)
+        self.hotkey_show_window_signal.connect(self._show_and_focus_input)
+
+    def _register_window_shortcuts(self):
+        """Keyboard shortcuts available while the assistant window is active."""
+        shortcuts = (
+            ("Ctrl+L", self._focus_input),
+            ("Ctrl+N", self._new_conversation_from_shortcut),
+            ("Escape", self._handle_escape_shortcut),
+        )
+        for sequence, callback in shortcuts:
+            try:
+                shortcut = QShortcut(QKeySequence(sequence), self)
+                shortcut.setContext(Qt.ApplicationShortcut)
+                shortcut.activated.connect(callback)
+                self._window_shortcuts.append(shortcut)
+            except Exception:
+                logger.exception("Не удалось зарегистрировать сочетание %s.", sequence)
+
+    def _focus_input(self):
+        self.input.setFocus(Qt.OtherFocusReason)
+
+    def _new_conversation_from_shortcut(self):
+        if self.processor is not None:
+            self.processor.new_conversation()
+
+    def _handle_escape_shortcut(self):
+        if self.cancel_button.isVisible():
+            self._cancel_generation()
+        elif self.speech_output.is_speaking():
+            self.speech_output.stop()
+            self._poll_tts_state(force=True)
+
+    def _show_and_focus_input(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._focus_input()
+
+    def _on_voice_hotkey(self):
+        self.hotkey_show_window_signal.emit()
+        self.hotkey_toggle_signal.emit()
+
+    def _on_push_to_talk_pressed(self):
+        self.hotkey_show_window_signal.emit()
+        self.hotkey_set_listening_signal.emit(True)
+
+    @staticmethod
+    def _normalized_hotkey(value: str) -> str:
+        return re.sub(r"\\s+", "", (value or "").strip().lower())
 
     def _register_hotkey(self):
-        try:
-            hotkey = str(
-                self.settings_store.get("hotkey", "ctrl+shift+space")
-            ).strip()
-            mode = str(self.settings_store.get("activation_mode", "continuous"))
-            if mode == "push_to_talk":
+        self._hotkey_handles.clear()
+        voice_hotkey = str(
+            self.settings_store.get("hotkey", "ctrl+shift+space")
+        ).strip()
+        show_hotkey = str(
+            self.settings_store.get("show_hotkey", "ctrl+shift+a")
+        ).strip()
+        mode = str(self.settings_store.get("activation_mode", "continuous"))
+        registered = False
+
+        if voice_hotkey:
+            try:
+                if mode == "push_to_talk":
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(
+                            voice_hotkey, self._on_push_to_talk_pressed
+                        )
+                    )
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(
+                            voice_hotkey,
+                            lambda: self.hotkey_set_listening_signal.emit(False),
+                            trigger_on_release=True,
+                        )
+                    )
+                else:
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(voice_hotkey, self._on_voice_hotkey)
+                    )
+                registered = True
+            except Exception:
+                logger.exception("Не удалось зарегистрировать горячую клавишу прослушивания.")
+
+        if (
+            show_hotkey
+            and self._normalized_hotkey(show_hotkey)
+            != self._normalized_hotkey(voice_hotkey)
+        ):
+            try:
                 self._hotkey_handles.append(
                     keyboard.add_hotkey(
-                        hotkey,
-                        lambda: self.hotkey_set_listening_signal.emit(True),
+                        show_hotkey, self.hotkey_show_window_signal.emit
                     )
                 )
-                self._hotkey_handles.append(
-                    keyboard.add_hotkey(
-                        hotkey,
-                        lambda: self.hotkey_set_listening_signal.emit(False),
-                        trigger_on_release=True,
-                    )
-                )
-            else:
-                self._hotkey_handles.append(
-                    keyboard.add_hotkey(hotkey, self.hotkey_toggle_signal.emit)
-                )
-            self._hotkey_registered = True
-        except Exception:
-            logger.exception("Не удалось зарегистрировать горячую клавишу.")
-            self._hotkey_registered = False
-            self._update_status("Горячая клавиша недоступна")
+                registered = True
+            except Exception:
+                logger.exception("Не удалось зарегистрировать глобальную клавишу вызова.")
+
+        self._hotkey_registered = registered
+        if not registered:
+            self._update_status("Глобальные горячие клавиши недоступны")
 
     def _unregister_hotkey(self):
         if self._hotkey_registered:
@@ -1221,6 +1295,7 @@ class AssistantWindow(QWidget):
         role: str,
         with_actions: bool = True,
         metadata: dict | None = None,
+        message_id: int | None = None,
     ) -> ChatBubble:
         bubble = ChatBubble(text, role, self._available_bubble_width())
 
@@ -1258,7 +1333,9 @@ class AssistantWindow(QWidget):
             )
             vertical.addWidget(action_row, 0, Qt.AlignLeft)
         elif role == "user" and with_actions:
-            action_row, edit_button = self._create_user_message_actions(bubble)
+            action_row, edit_button = self._create_user_message_actions(
+                bubble, message_id
+            )
             vertical.addWidget(action_row, 0, Qt.AlignRight)
 
         insert_at = max(0, self.chat_layout.count() - 1)
@@ -1280,6 +1357,7 @@ class AssistantWindow(QWidget):
             "bubble": bubble,
             "container": container,
             "role": role,
+            "message_id": message_id,
             "actions": action_row,
             "copy": copy_button,
             "retry": retry_button,
@@ -1299,25 +1377,33 @@ class AssistantWindow(QWidget):
             if block.strip()
         ]
 
-    def _create_user_message_actions(self, bubble: ChatBubble):
+    def _create_user_message_actions(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
         row = QWidget()
         row.setStyleSheet("background: transparent;")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(1, 0, 1, 0)
-        edit_button = QPushButton("Изменить вопрос")
+        edit_button = QPushButton("Изменить и повторить")
         edit_button.setFixedHeight(27)
         edit_button.clicked.connect(
-            lambda _checked=False, b=bubble: self._edit_last_user_message(b)
+            lambda _checked=False, b=bubble, mid=message_id:
+                self._edit_user_message(b, mid)
         )
         layout.addWidget(edit_button)
         return row, edit_button
 
-    def _edit_last_user_message(self, bubble: ChatBubble):
+    def _edit_user_message(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
         text, accepted = QInputDialog.getMultiLineText(
             self, "Редактировать вопрос", "Текст вопроса:", bubble.text
         )
         if accepted and text.strip():
-            self.processor.edit_last_user_message(text.strip())
+            if message_id is None:
+                self.processor.edit_last_user_message(text.strip())
+            else:
+                self.processor.edit_user_message(message_id, text.strip())
 
     def _create_message_actions(self, bubble: ChatBubble):
         row = QWidget()
@@ -1363,16 +1449,16 @@ class AssistantWindow(QWidget):
         layout.addStretch(1)
         return row, copy_button, retry_button
 
-    def _show_user_message(self, text: str):
+    def _show_user_message(self, text: str, message_id: int):
         self._remove_typing()
 
         for entry in self._message_entries:
             if entry.get("retry") is not None:
                 entry["retry"].setVisible(False)
-            if entry.get("edit") is not None:
-                entry["edit"].setVisible(False)
 
-        self._add_bubble(text, "user", with_actions=True)
+        self._add_bubble(
+            text, "user", with_actions=True, message_id=message_id
+        )
 
     def _show_assistant_message(self, text: str):
         self._remove_typing()
@@ -1597,11 +1683,6 @@ class AssistantWindow(QWidget):
                 (i for i, item in enumerate(messages) if item.get("role") == "assistant"),
                 default=-1,
             )
-            last_user_index = max(
-                (i for i, item in enumerate(messages) if item.get("role") == "user"),
-                default=-1,
-            )
-
             for i, message in enumerate(messages):
                 role = message.get("role", "assistant")
 
@@ -1613,9 +1694,14 @@ class AssistantWindow(QWidget):
                     role,
                     with_actions=(
                         (role == "assistant" and i == last_assistant_index)
-                        or (role == "user" and i == last_user_index)
+                        or role == "user"
                     ),
                     metadata=message if role == "assistant" else None,
+                    message_id=(
+                        int(message["id"])
+                        if role == "user" and message.get("id") is not None
+                        else None
+                    ),
                 )
 
         else:
@@ -1647,7 +1733,7 @@ class AssistantWindow(QWidget):
     # ---------------------------------------------------------------
 
     def _send_typed_message(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
 
         if not text:
             return
