@@ -10,8 +10,8 @@ from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QAbstractAnimation, QEvent, QObject, QTimer,
-    QPropertyAnimation, QEasingCurve, Signal, QPointF
+    Qt, QEvent, QObject, QTimer, QPropertyAnimation,
+    QEasingCurve, Signal, QPointF
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
@@ -37,7 +37,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r12"
+BUILD_VERSION = "2026.10.21-r13"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -847,18 +847,13 @@ class TypingBubble(QFrame):
 
 
 class ChatWheelFilter(QObject):
-    """Smoothly route wheel input over chat widgets to the chat scroll area."""
+    """Route each mouse-wheel event directly to the chat scroll bar."""
 
     scroll_target_changed = Signal(int, int)
 
     def __init__(self, scroll_area: QScrollArea):
         super().__init__(scroll_area)
         self.scroll_area = scroll_area
-        self._animation = QPropertyAnimation(
-            scroll_area.verticalScrollBar(), b"value", self
-        )
-        self._animation.setDuration(115)
-        self._animation.setEasingCurve(QEasingCurve.OutCubic)
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.Wheel:
@@ -866,33 +861,28 @@ class ChatWheelFilter(QObject):
             angle_delta = event.angleDelta().y()
 
             if pixel_delta:
+                # Trackpads provide pixel deltas; use them directly.
                 distance = float(pixel_delta)
             elif angle_delta:
-                # One standard wheel notch should move a few text lines,
-                # not jump by the raw 120-point Qt angle value.
-                distance = (float(angle_delta) / 120.0) * 76.0
+                # Windows mouse wheels typically report 120 units per notch.
+                # A notch now scrolls about five lines instead of restarting
+                # an animation that can eat most movements during fast turns.
+                distance = (float(angle_delta) / 120.0) * 110.0
             else:
                 return super().eventFilter(watched, event)
 
             scrollbar = self.scroll_area.verticalScrollBar()
             maximum = scrollbar.maximum()
-            target_base = scrollbar.value()
-            if self._animation.state() == QAbstractAnimation.State.Running:
-                end_value = self._animation.endValue()
-                if end_value is not None:
-                    try:
-                        target_base = int(end_value)
-                    except (TypeError, ValueError):
-                        pass
-
             target = max(
                 0,
-                min(maximum, int(round(target_base - distance))),
+                min(
+                    maximum,
+                    scrollbar.value() - int(round(distance)),
+                ),
             )
-            self._animation.stop()
-            self._animation.setStartValue(scrollbar.value())
-            self._animation.setEndValue(target)
-            self._animation.start()
+            # Apply every wheel event immediately. Animating and restarting
+            # on each event caused fast wheel input to move only a few pixels.
+            scrollbar.setValue(target)
             self.scroll_target_changed.emit(target, maximum)
             event.accept()
             return True
