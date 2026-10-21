@@ -23,6 +23,7 @@ logger = logging.getLogger("live_assistant.processor")
 class MessageProcessor(QThread):
     user_message = Signal(str, int)
     assistant_message = Signal(str)
+    assistant_error = Signal(str, bool)
     assistant_chunk = Signal(str)
     answer_metadata = Signal(str, int)
     typing_changed = Signal(bool)
@@ -112,8 +113,13 @@ class MessageProcessor(QThread):
         self._client.cancel_active_request()
 
     def stop(self) -> None:
-        self._running = False
-        self.cancel_current()
+        """Stop accepting work and cancel an active request without a shutdown race."""
+        with self._cancel_lock:
+            self._running = False
+            cancel_event = self._cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
+        self._client.cancel_active_request()
         self._queue.put(None)
 
     def list_conversations(self, query: str = "") -> list[dict[str, Any]]:
@@ -171,6 +177,10 @@ class MessageProcessor(QThread):
         return [{"role": "system", "content": system_content}] + messages
 
     def _run_message(self, text: str, bypass_filter: bool, persist_user: bool = True) -> None:
+        with self._cancel_lock:
+            if not self._running:
+                return
+
         if not bypass_filter:
             if self._duplicates.is_duplicate(text):
                 logger.info("Повтор голосовой фразы пропущен: %s", text)
@@ -183,20 +193,34 @@ class MessageProcessor(QThread):
                     logger.info("Решение фильтра (%s): %s", reason, text)
                 except OllamaError as exc:
                     logger.exception("Ошибка классификации неоднозначной фразы.")
-                    self.status_changed.emit("Ошибка классификатора")
-                    self.assistant_message.emit(f"Ошибка классификатора: {exc}")
+                    if self._running:
+                        self.status_changed.emit("Ошибка классификатора")
+                        # No user turn has been saved yet, so this error cannot
+                        # be retried as a response to the current phrase.
+                        self.assistant_error.emit(
+                            f"Ошибка классификатора: {exc}", False
+                        )
                     return
                 if not accepted:
                     self.status_changed.emit(f"Фраза пропущена фильтром: {reason}")
                     return
 
         if persist_user:
-            message_id = self.store.add_message(self._conversation_id, "user", text)
+            with self._cancel_lock:
+                if not self._running:
+                    return
+                message_id = self.store.add_message(
+                    self._conversation_id, "user", text
+                )
             self.user_message.emit(text, message_id)
             self._emit_saved_conversations()
 
         cancel_event = threading.Event()
         with self._cancel_lock:
+            # stop() uses the same lock. If shutdown wins the race, do not
+            # create a fresh request after the active request was cancelled.
+            if not self._running:
+                return
             self._cancel_event = cancel_event
 
         self.typing_changed.emit(True)
@@ -234,12 +258,22 @@ class MessageProcessor(QThread):
                 raise OllamaError("Поток завершился без текста ответа.")
         except OllamaError as exc:
             logger.exception("Не удалось получить ответ от Ollama.")
-            self.assistant_message.emit(f"Ошибка ответа: {exc}")
-            self.status_changed.emit("Не удалось получить ответ")
+            if self._running and not cancel_event.is_set():
+                error_text = f"Ошибка ответа: {exc}"
+                self.store.add_message(
+                    self._conversation_id, "error", error_text
+                )
+                self.assistant_error.emit(error_text, True)
+                self.status_changed.emit("Не удалось получить ответ")
         except Exception as exc:
             logger.exception("Неожиданная ошибка обработки сообщения.")
-            self.assistant_message.emit(f"Ошибка обработки: {exc}")
-            self.status_changed.emit("Ошибка обработки сообщения")
+            if self._running and not cancel_event.is_set():
+                error_text = f"Ошибка обработки: {exc}"
+                self.store.add_message(
+                    self._conversation_id, "error", error_text
+                )
+                self.assistant_error.emit(error_text, True)
+                self.status_changed.emit("Ошибка обработки сообщения")
         finally:
             with self._cancel_lock:
                 if self._cancel_event is cancel_event:
@@ -328,16 +362,22 @@ class MessageProcessor(QThread):
 
     def run(self) -> None:
         self._emit_current_conversation()
-        while self._running:
+        while True:
             try:
                 item = self._queue.get(timeout=0.25)
             except queue.Empty:
+                if not self._running:
+                    break
                 continue
-            if item is None:
+
+            # stop() may run while get() is blocked. Re-check after the item
+            # is retrieved so queued messages aren't started during shutdown.
+            if item is None or not self._running:
                 break
+
             command, payload = item
             if command == "MESSAGE":
                 text, bypass_filter = payload
                 self._run_message(text, bypass_filter)
-            else:
+            elif self._running:
                 self._handle_control(command, payload)
