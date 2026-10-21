@@ -37,7 +37,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r13"
+BUILD_VERSION = "2026.10.21-r14"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -662,7 +662,7 @@ class ChatBubble(QFrame):
 
     def _build(self):
         is_user = self.role == "user"
-        is_system = self.role == "system"
+        is_system = self.role in {"system", "error"}
 
         if is_user:
             frame_bg = "rgba(197, 214, 255, 242)"
@@ -676,7 +676,7 @@ class ChatBubble(QFrame):
             border = "rgba(255, 147, 164, 100)"
             text_color = "#FFF1F4"
             role_color = "#FFC0CC"
-            role_text = "Система"
+            role_text = "Ошибка" if self.role == "error" else "Система"
             margins = (13, 10, 13, 11)
         else:
             frame_bg = "transparent"
@@ -1211,6 +1211,7 @@ class AssistantWindow(QWidget):
 
         self.processor.user_message.connect(self._show_user_message)
         self.processor.assistant_message.connect(self._show_assistant_message)
+        self.processor.assistant_error.connect(self._show_assistant_error)
         self.processor.assistant_chunk.connect(self._append_stream_chunk)
         self.processor.answer_metadata.connect(self._show_answer_metadata)
         self.processor.typing_changed.connect(self._set_typing)
@@ -1390,7 +1391,7 @@ class AssistantWindow(QWidget):
         edit_button = None
         repeat_user_button = None
 
-        if role == "assistant" and with_actions:
+        if role in {"assistant", "error"} and with_actions:
             action_row, retry_button = self._create_message_actions(bubble)
             vertical.addWidget(action_row, 0, Qt.AlignLeft)
         elif role == "user" and with_actions:
@@ -1525,16 +1526,10 @@ class AssistantWindow(QWidget):
         )
 
     def _show_assistant_message(self, text: str):
+        """Display a successful assistant answer without inspecting its text."""
         self._remove_typing()
 
-        is_error = text.startswith((
-            "Ошибка ответа:",
-            "Не удалось",
-            "Ошибка классификатора:",
-            "Ошибка обработки:",
-        ))
-
-        if self._streaming_bubble is not None and not is_error:
+        if self._streaming_bubble is not None:
             if self._stream_timer.isActive():
                 self._stream_timer.stop()
 
@@ -1547,19 +1542,27 @@ class AssistantWindow(QWidget):
             self._streaming_container = None
             self._streaming_text = ""
             self._pending_stream_text = ""
-
         else:
-            if self._streaming_bubble is not None and is_error:
-                self._remove_streaming_row()
-
-            self._add_bubble(
-                text, "system" if is_error else "assistant"
-            )
+            self._add_bubble(text, "assistant")
 
         if self._follow_stream_output:
             QTimer.singleShot(0, self._scroll_to_bottom_if_following)
-        if not is_error and bool(self.settings_store.get("speech_output_enabled", False)):
+        if bool(self.settings_store.get("speech_output_enabled", False)):
             self._speak_text(text)
+
+    def _show_assistant_error(self, text: str, retryable: bool = False):
+        """Display typed processing errors; retry only when a user turn exists."""
+        self._remove_typing()
+        if self._streaming_bubble is not None:
+            self._remove_streaming_row()
+
+        self._add_bubble(
+            text,
+            "error",
+            with_actions=bool(retryable),
+        )
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _show_answer_metadata(self, model: str, duration_ms: int):
         for entry in reversed(self._message_entries):
@@ -1693,7 +1696,7 @@ class AssistantWindow(QWidget):
 
     def _remove_latest_assistant_display(self):
         for entry in reversed(self._message_entries):
-            if entry["role"] == "assistant":
+            if entry["role"] in {"assistant", "error"}:
                 container = entry["container"]
 
                 self.chat_layout.removeWidget(container)
@@ -1747,21 +1750,24 @@ class AssistantWindow(QWidget):
         self._clear_chat_widgets(show_welcome=False)
 
         if messages:
-            last_assistant_index = max(
-                (i for i, item in enumerate(messages) if item.get("role") == "assistant"),
+            last_response_index = max(
+                (
+                    i for i, item in enumerate(messages)
+                    if item.get("role") in {"assistant", "error"}
+                ),
                 default=-1,
             )
             for i, message in enumerate(messages):
                 role = message.get("role", "assistant")
 
-                if role not in {"user", "assistant", "system"}:
+                if role not in {"user", "assistant", "system", "error"}:
                     role = "assistant"
 
                 self._add_bubble(
                     str(message.get("content", "")),
                     role,
                     with_actions=(
-                        (role == "assistant" and i == last_assistant_index)
+                        (role in {"assistant", "error"} and i == last_response_index)
                         or role == "user"
                     ),
                     metadata=message if role == "assistant" else None,
