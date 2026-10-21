@@ -222,6 +222,13 @@ false — обычный разговор людей между собой, ре
                 self._url(), json=payload, stream=True, timeout=(5, timeout)
             )
             self._set_active(response)
+            # Cancellation can happen while requests.post is establishing the
+            # connection, before the response becomes visible to cancel_current.
+            # Re-check immediately after publishing the response to close that
+            # small race instead of waiting for the next streamed line.
+            if cancel_event.is_set():
+                response.close()
+                return
             response.raise_for_status()
 
             for raw_line in response.iter_lines(decode_unicode=True):
