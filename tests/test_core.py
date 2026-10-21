@@ -31,6 +31,14 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(messages[1]["model"], "gemma:2b")
             self.assertEqual(len(store.list_conversations("цикл")), 1)
             self.assertEqual(len(store.context_messages(conversation_id, 2)), 2)
+            store.set_pinned(conversation_id, True)
+            self.assertEqual(store.list_conversations()[0]["is_pinned"], 1)
+            store.add_message(conversation_id, "user", "Старый вопрос")
+            store.add_message(conversation_id, "assistant", "Старый ответ")
+            self.assertTrue(store.edit_last_user_message(conversation_id, "Исправленный вопрос"))
+            messages = store.get_messages(conversation_id)
+            self.assertEqual(messages[-1]["role"], "user")
+            self.assertEqual(messages[-1]["content"], "Исправленный вопрос")
 
     def test_rules_and_duplicate_filter(self):
         self.assertEqual(classify_by_rules("Объясни, что делает цикл"), "accept")
