@@ -47,12 +47,40 @@ class AudioWorker(QThread):
         self._listening = bool(enabled)
         self.listening_changed.emit(self._listening)
         self.status_changed.emit(
-            "Слушаю системный звук" if self._listening else "Прослушивание на паузе"
+            self._source_status() if self._listening else "Прослушивание на паузе"
         )
 
     @property
     def listening(self) -> bool:
         return self._listening
+
+    def _capture_device(self):
+        if str(self.settings.get("audio_source", "loopback")) != "microphone":
+            return self._loopback_microphone()
+        selected = str(self.settings.get("microphone_device", "По умолчанию"))
+        try:
+            microphones = sc.all_microphones(include_loopback=False)
+        except Exception:
+            logger.exception("Не удалось получить список микрофонов.")
+            microphones = []
+        if selected and selected != "По умолчанию":
+            microphone = next((item for item in microphones if item.name == selected), None)
+            if microphone is None:
+                self.status_changed.emit(
+                    f"Микрофон «{selected}» не найден; использую устройство по умолчанию"
+                )
+                microphone = sc.default_microphone()
+        else:
+            microphone = sc.default_microphone()
+        if microphone is None:
+            raise RuntimeError("Windows не сообщает доступный микрофон.")
+        logger.info("Входной микрофон: %s", microphone.name)
+        return microphone
+
+    def _source_status(self) -> str:
+        if str(self.settings.get("audio_source", "loopback")) == "microphone":
+            return "Слушаю микрофон"
+        return "Слушаю системный звук"
 
     def _loopback_microphone(self):
         selected = str(self.settings.get("audio_device", "По умолчанию"))
@@ -118,8 +146,8 @@ class AudioWorker(QThread):
                 device=WHISPER_DEVICE,
                 compute_type=WHISPER_COMPUTE_TYPE,
             )
-            mic = self._loopback_microphone()
-            self.status_changed.emit("Слушаю системный звук")
+            mic = self._capture_device()
+            self.status_changed.emit(self._source_status())
 
             buffer: list[np.ndarray] = []
             speech_seconds = 0.0
@@ -159,7 +187,9 @@ class AudioWorker(QThread):
                             silence_seconds += CHUNK_DURATION
 
                         finished = in_speech and silence_seconds >= silence_limit
-                        too_long = speech_seconds >= MAX_PHRASE_DURATION
+                        max_phrase_duration = float(self.settings.get("max_phrase_duration", MAX_PHRASE_DURATION))
+                        max_phrase_duration = max(5.0, min(120.0, max_phrase_duration))
+                        too_long = speech_seconds >= max_phrase_duration
                         if finished or too_long:
                             if buffer and speech_seconds >= MIN_SPEECH_DURATION:
                                 self.status_changed.emit("Распознаю речь…")
@@ -172,7 +202,7 @@ class AudioWorker(QThread):
                             in_speech = False
                             self.audio_level.emit(0.0)
                             if self._running and self._listening:
-                                self.status_changed.emit("Слушаю системный звук")
+                                self.status_changed.emit(self._source_status())
                     except Exception:
                         logger.exception("Ошибка захвата системного аудио; повторяю.")
                         self.status_changed.emit("Проблема с аудио — пытаюсь восстановить запись")

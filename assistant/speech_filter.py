@@ -216,7 +216,14 @@ class DuplicateFilter:
                     return True
 
                 if len(normalized) >= 18 and len(previous) >= 18:
-                    if normalized in previous or previous in normalized:
+                    shorter, longer = sorted(
+                        (normalized, previous), key=len
+                    )
+                    # Whisper may return an overlapping phrase with a few
+                    # extra words on the next chunk. Suppress near-identical
+                    # duplicates, but keep genuine continuations that add
+                    # substantial new information.
+                    if shorter in longer and len(shorter) / len(longer) >= 0.80:
                         return True
 
             self.items.append((normalized, now))

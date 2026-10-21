@@ -1,34 +1,44 @@
 """Modern dark-glass chat UI for Live Assistant."""
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import logging
 import math
+import re
 import sys
 from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
+    Qt, QEvent, QObject, QTimer, QPropertyAnimation,
+    QEasingCurve, Signal, QPointF
 )
 from PySide6.QtGui import (
-    QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath
+    QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
+    QSyntaxHighlighter, QTextCharFormat, QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QLineEdit, QGraphicsOpacityEffect,
-    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip
+    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
+    QSystemTrayIcon, QStyle
 )
 
 from .audio_worker import AudioWorker
-from .config import DEFAULT_BACKGROUND_ALPHA
+from .chat_input import ChatInput
+from .config import (
+    DEFAULT_BACKGROUND_ALPHA,
+    DEFAULT_BACKGROUND_SATURATION,
+)
 from .conversation_store import ConversationStore
 from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore
+from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r6"
+BUILD_VERSION = "2026.10.21-r16"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -156,7 +166,7 @@ QPushButton#listenButton[active="false"] {
     border-color: rgba(240, 195, 110, 55);
 }
 
-QLineEdit {
+QLineEdit, QPlainTextEdit {
     color: #F4F5FF;
     background-color: rgba(9, 11, 18, 170);
     border: 1px solid rgba(171, 183, 231, 45);
@@ -165,7 +175,7 @@ QLineEdit {
     selection-background-color: #667CE0;
 }
 
-QLineEdit:focus {
+QLineEdit:focus, QPlainTextEdit:focus {
     border-color: rgba(150, 165, 255, 145);
     background-color: rgba(10, 12, 21, 220);
 }
@@ -304,8 +314,8 @@ class IconButton(QPushButton):
         "send",
         "pause",
         "play",
-        "copy",
         "retry",
+        "edit",
         "plus",
         "search",
         "settings",
@@ -421,16 +431,6 @@ class IconButton(QPushButton):
             path.closeSubpath()
             painter.drawPath(path)
 
-        elif self.icon_name == "copy":
-            painter.drawRoundedRect(
-                int(s * 0.34), int(s * 0.17),
-                int(s * 0.46), int(s * 0.49), 2, 2,
-            )
-            painter.drawRoundedRect(
-                int(s * 0.19), int(s * 0.34),
-                int(s * 0.46), int(s * 0.49), 2, 2,
-            )
-
         elif self.icon_name == "retry":
             path.moveTo(s * 0.76, s * 0.36)
             path.lineTo(s * 0.76, s * 0.12)
@@ -441,6 +441,19 @@ class IconButton(QPushButton):
                 int(s * 0.61), int(s * 0.64),
                 35 * 16, 285 * 16,
             )
+
+        elif self.icon_name == "edit":
+            path.moveTo(s * 0.22, s * 0.75)
+            path.lineTo(s * 0.64, s * 0.33)
+            path.lineTo(s * 0.76, s * 0.45)
+            path.lineTo(s * 0.34, s * 0.87)
+            path.lineTo(s * 0.17, s * 0.90)
+            path.closeSubpath()
+            painter.drawPath(path)
+            path = QPainterPath()
+            path.moveTo(s * 0.56, s * 0.40)
+            path.lineTo(s * 0.68, s * 0.52)
+            painter.drawPath(path)
 
         elif self.icon_name == "plus":
             path.moveTo(s * 0.50, s * 0.22)
@@ -567,6 +580,61 @@ class WaveformWidget(QWidget):
         painter.end()
 
 
+class CodeSyntaxHighlighter(QSyntaxHighlighter):
+    """Color common tokens inside Markdown code blocks without third-party packages."""
+
+    _DOUBLE_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+    _SINGLE_STRING = re.compile(r"'(?:\\.|[^'\\])*'")
+    _COMMENT = re.compile(r"(#.*|//.*)")
+    _NUMBER = re.compile(r"\b\d+(?:\.\d+)?\b")
+    _KEYWORD = re.compile(
+        r"\b(?:False|True|None|and|as|assert|async|await|break|class|continue|def|del|"
+        r"elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|"
+        r"not|or|pass|raise|return|try|while|with|yield|fun|val|var|object|package|"
+        r"public|private|protected|internal|override|data|when|interface|const|let|"
+        r"function|export|default|new|this|typeof|null|undefined|SELECT|FROM|WHERE|"
+        r"JOIN|INSERT|UPDATE|DELETE|CREATE|TABLE|ORDER|BY|GROUP|AND|OR|NOT|AS)\b",
+        re.IGNORECASE,
+    )
+    _FUNCTION = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*(?=\s*\()")
+
+    def __init__(self, document):
+        super().__init__(document)
+        colors = {
+            "string": "#A8D7A3",
+            "comment": "#82909F",
+            "number": "#D9B7FF",
+            "keyword": "#8DAAFF",
+            "function": "#F3C98B",
+        }
+        self._formats = {}
+        for name, color in colors.items():
+            style = QTextCharFormat()
+            style.setForeground(QColor(color))
+            self._formats[name] = style
+
+    def highlightBlock(self, text: str):
+        # Qt Markdown marks fenced-code lines as non-breakable blocks.
+        if not self.currentBlock().blockFormat().nonBreakableLines():
+            return
+        occupied = [False] * len(text)
+        rules = (
+            ("string", self._DOUBLE_STRING),
+            ("string", self._SINGLE_STRING),
+            ("comment", self._COMMENT),
+            ("number", self._NUMBER),
+            ("keyword", self._KEYWORD),
+            ("function", self._FUNCTION),
+        )
+        for kind, pattern in rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                if any(occupied[start:end]):
+                    continue
+                self.setFormat(start, end - start, self._formats[kind])
+                occupied[start:end] = [True] * (end - start)
+
+
 class ChatBubble(QFrame):
     """Responsive message bubble with Markdown rendering."""
 
@@ -595,7 +663,7 @@ class ChatBubble(QFrame):
 
     def _build(self):
         is_user = self.role == "user"
-        is_system = self.role == "system"
+        is_system = self.role in {"system", "error"}
 
         if is_user:
             frame_bg = "rgba(197, 214, 255, 242)"
@@ -609,7 +677,7 @@ class ChatBubble(QFrame):
             border = "rgba(255, 147, 164, 100)"
             text_color = "#FFF1F4"
             role_color = "#FFC0CC"
-            role_text = "Система"
+            role_text = "Ошибка" if self.role == "error" else "Система"
             margins = (13, 10, 13, 11)
         else:
             frame_bg = "transparent"
@@ -681,6 +749,7 @@ class ChatBubble(QFrame):
             }}
         """)
 
+        self._code_highlighter = CodeSyntaxHighlighter(self.body.document())
         self.body.setMarkdown(self.text)
         layout.addWidget(self.role_label)
         layout.addWidget(self.body)
@@ -778,19 +847,79 @@ class TypingBubble(QFrame):
         self.timer.stop()
 
 
+class ChatWheelFilter(QObject):
+    """Route each mouse-wheel event directly to the chat scroll bar."""
+
+    scroll_target_changed = Signal(int, int)
+
+    def __init__(self, scroll_area: QScrollArea):
+        super().__init__(scroll_area)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel:
+            pixel_delta = event.pixelDelta().y()
+            angle_delta = event.angleDelta().y()
+
+            if pixel_delta:
+                # Trackpads provide pixel deltas; use them directly.
+                distance = float(pixel_delta)
+            elif angle_delta:
+                # Windows mouse wheels typically report 120 units per notch.
+                # A notch now scrolls about five lines instead of restarting
+                # an animation that can eat most movements during fast turns.
+                distance = (float(angle_delta) / 120.0) * 110.0
+            else:
+                return super().eventFilter(watched, event)
+
+            scrollbar = self.scroll_area.verticalScrollBar()
+            maximum = scrollbar.maximum()
+            target = max(
+                0,
+                min(
+                    maximum,
+                    scrollbar.value() - int(round(distance)),
+                ),
+            )
+            # Apply every wheel event immediately. Animating and restarting
+            # on each event caused fast wheel input to move only a few pixels.
+            scrollbar.setValue(target)
+            self.scroll_target_changed.emit(target, maximum)
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
+
+
 class AssistantWindow(QWidget):
     hotkey_toggle_signal = Signal()
+    hotkey_set_listening_signal = Signal(bool)
+    hotkey_show_window_signal = Signal()
 
     def __init__(self):
         super().__init__()
 
         self.settings_store = SettingsStore()
         self.conversation_store = ConversationStore()
+        self.speech_output = SpeechOutput()
+        self._tts_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="LocalAssistant-TTS",
+        )
+        self._tts_future: Future | None = None
+        self._tts_operation: str | None = None
+        self._tts_operation_id = 0
+        self._tts_shutting_down = False
+        self._tts_resume_listening = False
+        self._tts_watch_timer = QTimer(self)
+        self._tts_watch_timer.setInterval(250)
+        self._tts_watch_timer.timeout.connect(self._poll_tts_state)
 
         self.audio: AudioWorker | None = None
         self.processor: MessageProcessor | None = None
 
         self._acrylic_enabled = False
+        self._follow_stream_output = True
         self._typing_bubble: TypingBubble | None = None
         self._typing_row: QWidget | None = None
         self._streaming_bubble: ChatBubble | None = None
@@ -799,12 +928,18 @@ class AssistantWindow(QWidget):
         self._pending_stream_text = ""
 
         self._stream_timer = QTimer(self)
-        self._stream_timer.setInterval(45)
+        self._stream_timer.setInterval(80)
         self._stream_timer.timeout.connect(self._flush_stream_text)
 
         self._close_pending = False
+        self._exit_requested = False
         self._hotkey_registered = False
+        self._hotkey_handles: list[Any] = []
+        self._window_shortcuts: list[QShortcut] = []
         self._drag_position = None
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self.tray_pause_action = None
 
         self._bubbles: list[ChatBubble] = []
         self._rows: list[QWidget] = []
@@ -821,6 +956,7 @@ class AssistantWindow(QWidget):
         self.setMinimumSize(430, 540)
 
         self._build_ui()
+        self._register_window_shortcuts()
         self._apply_background_alpha()
 
         self.audio = AudioWorker(self.settings_store)
@@ -829,6 +965,9 @@ class AssistantWindow(QWidget):
         )
 
         self._connect_signals()
+        if str(self.settings_store.get("activation_mode", "continuous")) != "continuous":
+            self.audio.set_listening(False)
+        self._init_system_tray()
         self.audio.start()
         self.processor.start()
         self._register_hotkey()
@@ -836,6 +975,46 @@ class AssistantWindow(QWidget):
         self._apply_compact_mode(
             bool(self.settings_store.get("compact_mode", False))
         )
+
+    def _init_system_tray(self):
+        """Create a Windows notification-area icon when the tray is available."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("Системный трей недоступен; закрытие в трей отключено.")
+            return
+
+        self.tray_menu = QMenu(self)
+        show_action = self.tray_menu.addAction("Открыть Live Assistant")
+        show_action.triggered.connect(self._show_from_tray)
+
+        self.tray_pause_action = self.tray_menu.addAction(
+            "Приостановить прослушивание"
+        )
+        self.tray_pause_action.triggered.connect(self.toggle_listening)
+
+        self.tray_menu.addSeparator()
+        exit_action = self.tray_menu.addAction("Выход")
+        exit_action.triggered.connect(self._exit_from_tray)
+
+        self.tray_icon = QSystemTrayIcon(
+            QApplication.style().standardIcon(QStyle.SP_ComputerIcon), self
+        )
+        self.tray_icon.setToolTip("Live Assistant")
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_from_tray()
+
+    def _exit_from_tray(self):
+        self._exit_requested = True
+        self.close()
 
     def _set_window_flags(self):
         flags = Qt.Window | Qt.FramelessWindowHint
@@ -948,6 +1127,18 @@ class AssistantWindow(QWidget):
         root.addWidget(self.transcript_preview)
 
         self.scroll = QScrollArea()
+        self._chat_wheel_filter = ChatWheelFilter(self.scroll)
+        self._chat_wheel_filter.scroll_target_changed.connect(
+            self._on_chat_scroll_target_changed
+        )
+        self.scroll.installEventFilter(self._chat_wheel_filter)
+        self.scroll.viewport().installEventFilter(self._chat_wheel_filter)
+        self.scroll.verticalScrollBar().sliderPressed.connect(
+            self._on_chat_scrollbar_drag_started
+        )
+        self.scroll.verticalScrollBar().sliderReleased.connect(
+            self._on_chat_scrollbar_drag_finished
+        )
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -955,6 +1146,7 @@ class AssistantWindow(QWidget):
 
         self.chat_content = QWidget()
         self.chat_content.setStyleSheet("background: transparent;")
+        self.chat_content.installEventFilter(self._chat_wheel_filter)
 
         self.chat_layout = QVBoxLayout(self.chat_content)
         self.chat_layout.setContentsMargins(5, 8, 5, 9)
@@ -967,10 +1159,8 @@ class AssistantWindow(QWidget):
         composer = QHBoxLayout()
         composer.setSpacing(8)
 
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Напишите сообщение…")
-        self.input.setMinimumHeight(46)
-        self.input.returnPressed.connect(self._send_typed_message)
+        self.input = ChatInput()
+        self.input.send_requested.connect(self._send_typed_message)
 
         self.send_button = IconButton(
             "send",
@@ -998,11 +1188,12 @@ class AssistantWindow(QWidget):
         self.listen_button.setProperty("active", "true")
         self.listen_button.clicked.connect(self.toggle_listening)
 
-        help_label = QLabel("Ctrl + Shift + Space")
-        help_label.setObjectName("tiny")
+        self.hotkey_hint = QLabel()
+        self.hotkey_hint.setObjectName("tiny")
+        self._update_hotkey_hint()
 
         footer.addWidget(self.listen_button)
-        footer.addWidget(help_label)
+        footer.addWidget(self.hotkey_hint)
         footer.addStretch(1)
 
         self.resize_grip = QSizeGrip(self)
@@ -1029,6 +1220,7 @@ class AssistantWindow(QWidget):
 
         self.processor.user_message.connect(self._show_user_message)
         self.processor.assistant_message.connect(self._show_assistant_message)
+        self.processor.assistant_error.connect(self._show_assistant_error)
         self.processor.assistant_chunk.connect(self._append_stream_chunk)
         self.processor.answer_metadata.connect(self._show_answer_metadata)
         self.processor.typing_changed.connect(self._set_typing)
@@ -1040,28 +1232,122 @@ class AssistantWindow(QWidget):
         )
 
         self.hotkey_toggle_signal.connect(self.toggle_listening)
+        self.hotkey_set_listening_signal.connect(self._set_listening_from_hotkey)
+        self.hotkey_show_window_signal.connect(self._show_and_focus_input)
+
+    def _register_window_shortcuts(self):
+        """Keyboard shortcuts available while the assistant window is active."""
+        shortcuts = (
+            ("Ctrl+L", self._focus_input),
+            ("Ctrl+N", self._new_conversation_from_shortcut),
+            ("Escape", self._handle_escape_shortcut),
+        )
+        for sequence, callback in shortcuts:
+            try:
+                shortcut = QShortcut(QKeySequence(sequence), self)
+                shortcut.setContext(Qt.ApplicationShortcut)
+                shortcut.activated.connect(callback)
+                self._window_shortcuts.append(shortcut)
+            except Exception:
+                logger.exception("Не удалось зарегистрировать сочетание %s.", sequence)
+
+    def _focus_input(self):
+        self.input.setFocus(Qt.OtherFocusReason)
+
+    def _new_conversation_from_shortcut(self):
+        if self.processor is not None:
+            self.processor.new_conversation()
+
+    def _handle_escape_shortcut(self):
+        if self.cancel_button.isVisible():
+            self._cancel_generation()
+        elif self._is_tts_active():
+            self._stop_speech_async()
+
+    def _show_and_focus_input(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._focus_input()
+
+    def _on_voice_hotkey(self):
+        self.hotkey_show_window_signal.emit()
+        self.hotkey_toggle_signal.emit()
+
+    def _on_push_to_talk_pressed(self):
+        self.hotkey_show_window_signal.emit()
+        self.hotkey_set_listening_signal.emit(True)
+
+    @staticmethod
+    def _normalized_hotkey(value: str) -> str:
+        return re.sub(r"\s+", "", (value or "").strip().lower())
 
     def _register_hotkey(self):
-        try:
-            hotkey = str(
-                self.settings_store.get("hotkey", "ctrl+shift+space")
-            )
-            keyboard.add_hotkey(hotkey, self.hotkey_toggle_signal.emit)
-            self._hotkey_registered = True
+        self._hotkey_handles.clear()
+        voice_hotkey = str(
+            self.settings_store.get("hotkey", "ctrl+shift+space")
+        ).strip()
+        show_hotkey = str(
+            self.settings_store.get("show_hotkey", "ctrl+shift+a")
+        ).strip()
+        mode = str(self.settings_store.get("activation_mode", "continuous"))
+        registered = False
 
-        except Exception:
-            logger.exception("Не удалось зарегистрировать горячую клавишу.")
-            self._hotkey_registered = False
-            self._update_status("Горячая клавиша недоступна")
+        if voice_hotkey:
+            try:
+                if mode == "push_to_talk":
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(
+                            voice_hotkey, self._on_push_to_talk_pressed
+                        )
+                    )
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(
+                            voice_hotkey,
+                            lambda: self.hotkey_set_listening_signal.emit(False),
+                            trigger_on_release=True,
+                        )
+                    )
+                else:
+                    self._hotkey_handles.append(
+                        keyboard.add_hotkey(voice_hotkey, self._on_voice_hotkey)
+                    )
+                registered = True
+            except Exception:
+                logger.exception("Не удалось зарегистрировать горячую клавишу прослушивания.")
+
+        if (
+            show_hotkey
+            and self._normalized_hotkey(show_hotkey)
+            != self._normalized_hotkey(voice_hotkey)
+        ):
+            try:
+                self._hotkey_handles.append(
+                    keyboard.add_hotkey(
+                        show_hotkey, self.hotkey_show_window_signal.emit
+                    )
+                )
+                registered = True
+            except Exception:
+                logger.exception("Не удалось зарегистрировать глобальную клавишу вызова.")
+
+        self._hotkey_registered = registered
+        if not registered:
+            self._update_status("Глобальные горячие клавиши недоступны")
 
     def _unregister_hotkey(self):
         if self._hotkey_registered:
-            try:
-                keyboard.unhook_all_hotkeys()
-            except Exception:
-                logger.exception("Не удалось снять горячую клавишу.")
-
+            for handle in self._hotkey_handles:
+                try:
+                    keyboard.remove_hotkey(handle)
+                except Exception:
+                    logger.exception("Не удалось снять горячую клавишу.")
+            self._hotkey_handles.clear()
             self._hotkey_registered = False
+
+    def _set_listening_from_hotkey(self, enabled: bool):
+        if self.audio is not None:
+            self.audio.set_listening(enabled)
 
     # ---------------------------------------------------------------
     # Messages, Markdown, streaming and message actions
@@ -1081,6 +1367,7 @@ class AssistantWindow(QWidget):
         role: str,
         with_actions: bool = True,
         metadata: dict | None = None,
+        message_id: int | None = None,
     ) -> ChatBubble:
         bubble = ChatBubble(text, role, self._available_bubble_width())
 
@@ -1108,14 +1395,18 @@ class AssistantWindow(QWidget):
         vertical.addLayout(row)
 
         action_row = None
-        copy_button = None
         retry_button = None
+        edit_button = None
+        repeat_user_button = None
 
-        if role == "assistant" and with_actions:
-            action_row, copy_button, retry_button = (
-                self._create_message_actions(bubble)
-            )
+        if role in {"assistant", "error"} and with_actions:
+            action_row, retry_button = self._create_message_actions(bubble)
             vertical.addWidget(action_row, 0, Qt.AlignLeft)
+        elif role == "user" and with_actions:
+            action_row, edit_button, repeat_user_button = (
+                self._create_user_message_actions(bubble, message_id)
+            )
+            vertical.addWidget(action_row, 0, Qt.AlignRight)
 
         insert_at = max(0, self.chat_layout.count() - 1)
         self.chat_layout.insertWidget(insert_at, container)
@@ -1136,67 +1427,117 @@ class AssistantWindow(QWidget):
             "bubble": bubble,
             "container": container,
             "role": role,
+            "message_id": message_id,
             "actions": action_row,
-            "copy": copy_button,
             "retry": retry_button,
+            "edit": edit_button,
+            "repeat_user": repeat_user_button,
         })
+        self._install_chat_wheel_filter(container)
 
         QTimer.singleShot(30, self._scroll_to_bottom)
         return bubble
 
-    def _create_message_actions(self, bubble: ChatBubble):
+    def _create_user_message_actions(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
+        """Create a roomy icon-only action row under a user message."""
         row = QWidget()
         row.setStyleSheet("background: transparent;")
+        row.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        row.setMinimumHeight(38)
 
+        layout = QHBoxLayout(row)
+        # Use fixed-size icon buttons and enough row height to avoid stylesheet
+        # padding clipping the old 27 px text button.
+        layout.setContentsMargins(3, 4, 3, 4)
+        layout.setSpacing(5)
+
+        edit_button = IconButton(
+            "edit",
+            size=30,
+            icon_size=16,
+            tooltip="Изменить вопрос и сгенерировать ответ заново",
+        )
+        edit_button.clicked.connect(
+            lambda _checked=False, b=bubble, mid=message_id:
+                self._edit_user_message(b, mid)
+        )
+
+        repeat_button = IconButton(
+            "retry",
+            size=30,
+            icon_size=16,
+            tooltip=(
+                "Повторить этот запрос. Последующие сообщения в диалоге "
+                "будут удалены, чтобы не смешивать разные ветки разговора."
+            ),
+        )
+        repeat_button.clicked.connect(
+            lambda _checked=False, b=bubble, mid=message_id:
+                self._repeat_user_message(b, mid)
+        )
+
+        layout.addWidget(edit_button)
+        layout.addWidget(repeat_button)
+        return row, edit_button, repeat_button
+
+    def _repeat_user_message(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
+        """Regenerate this user turn and discard later dependent turns."""
+        if message_id is None:
+            self.processor.edit_last_user_message(bubble.text)
+        else:
+            self.processor.edit_user_message(message_id, bubble.text)
+
+    def _edit_user_message(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
+        text, accepted = QInputDialog.getMultiLineText(
+            self, "Редактировать вопрос", "Текст вопроса:", bubble.text
+        )
+        if accepted and text.strip():
+            if message_id is None:
+                self.processor.edit_last_user_message(text.strip())
+            else:
+                self.processor.edit_user_message(message_id, text.strip())
+
+    def _create_message_actions(self, bubble: ChatBubble):
+        """Keep only the retry action below assistant answers."""
+        row = QWidget()
+        row.setStyleSheet("background: transparent;")
+        row.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(1, 2, 0, 0)
         layout.setSpacing(3)
 
-        copy_button = IconButton(
-            "copy",
-            size=28,
-            icon_size=15,
-            tooltip="Копировать ответ",
-        )
-        copy_button.clicked.connect(
-            lambda _checked=False, b=bubble:
-            QApplication.clipboard().setText(b.text)
-        )
-
         retry_button = IconButton(
-            "retry",
-            size=28,
-            icon_size=16,
-            tooltip="Повторить генерацию последнего ответа",
+            "retry", size=30, icon_size=16,
+            tooltip="Повторить генерацию последнего ответа"
         )
         retry_button.clicked.connect(self._regenerate_last)
 
-        layout.addWidget(copy_button)
         layout.addWidget(retry_button)
         layout.addStretch(1)
+        return row, retry_button
 
-        return row, copy_button, retry_button
-
-    def _show_user_message(self, text: str):
+    def _show_user_message(self, text: str, message_id: int):
         self._remove_typing()
 
         for entry in self._message_entries:
             if entry.get("retry") is not None:
                 entry["retry"].setVisible(False)
 
-        self._add_bubble(text, "user", with_actions=False)
+        self._add_bubble(
+            text, "user", with_actions=True, message_id=message_id
+        )
 
     def _show_assistant_message(self, text: str):
+        """Display a successful assistant answer without inspecting its text."""
         self._remove_typing()
 
-        is_error = text.startswith((
-            "Ошибка ответа:",
-            "Не удалось",
-            "Ошибка классификатора:",
-            "Ошибка обработки:",
-        ))
-
-        if self._streaming_bubble is not None and not is_error:
+        if self._streaming_bubble is not None:
             if self._stream_timer.isActive():
                 self._stream_timer.stop()
 
@@ -1209,16 +1550,27 @@ class AssistantWindow(QWidget):
             self._streaming_container = None
             self._streaming_text = ""
             self._pending_stream_text = ""
-
         else:
-            if self._streaming_bubble is not None and is_error:
-                self._remove_streaming_row()
+            self._add_bubble(text, "assistant")
 
-            self._add_bubble(
-                text, "system" if is_error else "assistant"
-            )
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
+        if bool(self.settings_store.get("speech_output_enabled", False)):
+            self._speak_text(text)
 
-        self._scroll_to_bottom()
+    def _show_assistant_error(self, text: str, retryable: bool = False):
+        """Display typed processing errors; retry only when a user turn exists."""
+        self._remove_typing()
+        if self._streaming_bubble is not None:
+            self._remove_streaming_row()
+
+        self._add_bubble(
+            text,
+            "error",
+            with_actions=bool(retryable),
+        )
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _show_answer_metadata(self, model: str, duration_ms: int):
         for entry in reversed(self._message_entries):
@@ -1260,8 +1612,10 @@ class AssistantWindow(QWidget):
         self._streaming_text += self._pending_stream_text
         self._pending_stream_text = ""
 
+        should_follow = self._follow_stream_output
         self._streaming_bubble.set_markdown(self._streaming_text)
-        self._scroll_to_bottom()
+        if should_follow:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _add_actions_to_existing_stream(self):
         if self._stream_timer.isActive():
@@ -1273,16 +1627,16 @@ class AssistantWindow(QWidget):
         ):
             return
 
-        action_row, copy_button, retry_button = (
+        action_row, retry_button = (
             self._create_message_actions(self._streaming_bubble)
         )
 
         self._streaming_container.layout().addWidget(action_row)
+        self._install_chat_wheel_filter(action_row)
 
         for entry in reversed(self._message_entries):
             if entry["bubble"] is self._streaming_bubble:
                 entry["actions"] = action_row
-                entry["copy"] = copy_button
                 entry["retry"] = retry_button
                 break
 
@@ -1350,7 +1704,7 @@ class AssistantWindow(QWidget):
 
     def _remove_latest_assistant_display(self):
         for entry in reversed(self._message_entries):
-            if entry["role"] == "assistant":
+            if entry["role"] in {"assistant", "error"}:
                 container = entry["container"]
 
                 self.chat_layout.removeWidget(container)
@@ -1370,6 +1724,7 @@ class AssistantWindow(QWidget):
         self.processor.regenerate_last_answer()
 
     def _scroll_to_bottom(self):
+        self._follow_stream_output = True
         scrollbar = self.scroll.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -1403,27 +1758,32 @@ class AssistantWindow(QWidget):
         self._clear_chat_widgets(show_welcome=False)
 
         if messages:
-            last_assistant_index = max(
+            last_response_index = max(
                 (
                     i for i, item in enumerate(messages)
-                    if item.get("role") == "assistant"
+                    if item.get("role") in {"assistant", "error"}
                 ),
                 default=-1,
             )
-
             for i, message in enumerate(messages):
                 role = message.get("role", "assistant")
 
-                if role not in {"user", "assistant", "system"}:
+                if role not in {"user", "assistant", "system", "error"}:
                     role = "assistant"
 
                 self._add_bubble(
                     str(message.get("content", "")),
                     role,
                     with_actions=(
-                        role == "assistant" and i == last_assistant_index
+                        (role in {"assistant", "error"} and i == last_response_index)
+                        or role == "user"
                     ),
                     metadata=message if role == "assistant" else None,
+                    message_id=(
+                        int(message["id"])
+                        if role == "user" and message.get("id") is not None
+                        else None
+                    ),
                 )
 
         else:
@@ -1455,7 +1815,7 @@ class AssistantWindow(QWidget):
     # ---------------------------------------------------------------
 
     def _send_typed_message(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
 
         if not text:
             return
@@ -1477,6 +1837,111 @@ class AssistantWindow(QWidget):
         self.processor.cancel_current()
         self._update_status("Останавливаю генерацию…")
 
+    def _is_tts_active(self) -> bool:
+        return (
+            self._tts_operation in {"starting", "speaking", "stopping"}
+            or self.speech_output.is_speaking()
+        )
+
+    def _start_speech_if_current(self, text: str, operation_id: int) -> bool:
+        """Run blocking process setup on the dedicated TTS worker thread."""
+        if self._tts_shutting_down or operation_id != self._tts_operation_id:
+            return False
+        return self.speech_output.speak(text)
+
+    def _toggle_speech(self, text: str):
+        if self._is_tts_active():
+            self._stop_speech_async()
+            return
+        self._speak_text(text)
+
+    def _speak_text(self, text: str):
+        if self._tts_shutting_down:
+            return
+
+        was_active = self._is_tts_active()
+        resume_after_existing = was_active and self._tts_resume_listening
+        may_resume = (
+            str(self.settings_store.get("activation_mode", "continuous"))
+            != "push_to_talk"
+            and self.audio is not None
+            and self.audio.listening
+        )
+        self._tts_resume_listening = bool(
+            resume_after_existing or may_resume
+        )
+
+        if self.audio is not None and self.audio.listening:
+            # Avoid capturing the assistant's own synthesized speech.
+            self.audio.set_listening(False)
+
+        self._tts_operation_id += 1
+        operation_id = self._tts_operation_id
+        self._tts_operation = "starting"
+        self._tts_future = self._tts_executor.submit(
+            self._start_speech_if_current, text, operation_id
+        )
+        self._update_status("Запускаю озвучивание…")
+        self._tts_watch_timer.start()
+
+    def _stop_speech_async(self):
+        """Stop SAPI off the UI thread and resume listening after it has stopped."""
+        if self._tts_shutting_down:
+            return
+        if not self._is_tts_active():
+            return
+
+        self._tts_operation_id += 1
+        self._tts_operation = "stopping"
+        self._tts_future = self._tts_executor.submit(self.speech_output.stop)
+        self._tts_watch_timer.start()
+
+    def _finish_tts_state(self):
+        self._tts_watch_timer.stop()
+        self._tts_future = None
+        self._tts_operation = None
+        should_resume = self._tts_resume_listening
+        self._tts_resume_listening = False
+        if (
+            should_resume
+            and not self._tts_shutting_down
+            and self.audio is not None
+        ):
+            self.audio.set_listening(True)
+
+    def _poll_tts_state(self):
+        operation = self._tts_operation
+        future = self._tts_future
+
+        if operation in {"starting", "stopping"}:
+            if future is None or not future.done():
+                return
+
+            try:
+                result = future.result()
+            except Exception:
+                logger.exception("Ошибка фоновой операции озвучивания.")
+                result = False
+
+            self._tts_future = None
+            if operation == "stopping":
+                self._finish_tts_state()
+                return
+
+            if not result:
+                self._update_status("Не удалось запустить локальное озвучивание")
+                self._finish_tts_state()
+                return
+
+            self._tts_operation = "speaking"
+            self._update_status("Озвучиваю ответ…")
+            operation = "speaking"
+
+        if operation == "speaking":
+            if self.speech_output.is_speaking():
+                return
+            self._finish_tts_state()
+
     def _show_menu(self):
         menu = QMenu(self)
 
@@ -1484,6 +1949,11 @@ class AssistantWindow(QWidget):
         history_menu = menu.addMenu("История диалогов")
 
         histories = self.processor.list_conversations()
+        current_meta = next(
+            (item for item in histories if int(item["id"]) == self._current_conversation_id),
+            {},
+        )
+        current_pinned = bool(current_meta.get("is_pinned", 0))
 
         if not histories:
             empty = history_menu.addAction("История пуста")
@@ -1491,6 +1961,8 @@ class AssistantWindow(QWidget):
         else:
             for conversation in histories[:30]:
                 label = str(conversation["title"])[:55]
+                if bool(conversation.get("is_pinned", 0)):
+                    label = "★  " + label
 
                 if int(conversation["id"]) == self._current_conversation_id:
                     label = "✓  " + label
@@ -1500,6 +1972,9 @@ class AssistantWindow(QWidget):
 
         search_action = menu.addAction("Поиск по истории")
         rename_action = menu.addAction("Переименовать диалог")
+        pin_chat_action = menu.addAction(
+            "Открепить текущий диалог" if current_pinned else "Закрепить текущий диалог"
+        )
         clear_action = menu.addAction("Очистить текущий диалог")
         delete_action = menu.addAction("Удалить текущий диалог")
 
@@ -1547,6 +2022,9 @@ class AssistantWindow(QWidget):
 
             if ok and title.strip():
                 self.processor.rename_current_conversation(title.strip())
+
+        elif chosen == pin_chat_action:
+            self.processor.toggle_pin_current_conversation()
 
         elif chosen == clear_action:
             answer = QMessageBox.question(
@@ -1648,12 +2126,15 @@ class AssistantWindow(QWidget):
         self._set_window_flags()
         self.show()
 
+        self._update_hotkey_hint()
         self._unregister_hotkey()
+        if before.get("activation_mode") != after.get("activation_mode") and self.audio is not None:
+            self.audio.set_listening(after.get("activation_mode") == "continuous")
         self._register_hotkey()
 
         audio_restart_needed = any(
             before.get(key) != after.get(key)
-            for key in ("audio_device", "whisper_model")
+            for key in ("audio_source", "audio_device", "microphone_device", "whisper_model")
         )
 
         if audio_restart_needed:
@@ -1661,6 +2142,7 @@ class AssistantWindow(QWidget):
 
     def _restart_audio_worker(self):
         old_worker = self.audio
+        was_listening = old_worker.listening
         old_worker.stop()
 
         if old_worker.isRunning() and not old_worker.wait(5000):
@@ -1676,6 +2158,8 @@ class AssistantWindow(QWidget):
         self.audio.status_changed.connect(self._update_status)
         self.audio.listening_changed.connect(self._update_listening)
         self.audio.audio_level.connect(self.waveform.set_level)
+        if not was_listening:
+            self.audio.set_listening(False)
         self.audio.start()
 
     def _toggle_compact_mode(self):
@@ -1694,6 +2178,22 @@ class AssistantWindow(QWidget):
             self.resize(570, 730)
 
         QTimer.singleShot(0, self._resize_bubbles)
+
+    def _update_hotkey_hint(self):
+        voice_hotkey = str(
+            self.settings_store.get("hotkey", "ctrl+shift+space")
+        ).strip()
+        show_hotkey = str(
+            self.settings_store.get("show_hotkey", "ctrl+shift+a")
+        ).strip()
+        self.hotkey_hint.setText(
+            f"Голос: {voice_hotkey} · Окно: {show_hotkey}"
+        )
+        self.hotkey_hint.setToolTip(
+            "Голос: переключить прослушивание (или удерживать для PTT).\n"
+            "Окно: показать помощника и перейти к вводу.\n"
+            "Ctrl+L — ввод · Ctrl+N — новый чат · Esc — остановить ответ/озвучивание."
+        )
 
     def _update_status(self, text: str):
         self.status_label.setText(text)
@@ -1734,9 +2234,42 @@ class AssistantWindow(QWidget):
         self.listen_button.style().unpolish(self.listen_button)
         self.listen_button.style().polish(self.listen_button)
         self.listen_button.update()
+        self._update_tray_pause_action(enabled)
+
+    def _update_tray_pause_action(self, enabled: bool):
+        if self.tray_pause_action is not None:
+            self.tray_pause_action.setText(
+                "Приостановить прослушивание"
+                if enabled else "Возобновить прослушивание"
+            )
 
     def toggle_listening(self):
         self.audio.set_listening(not self.audio.listening)
+
+    def _install_chat_wheel_filter(self, widget: QWidget):
+        """Ensure wheel input over any part of a message scrolls the chat."""
+        widget.installEventFilter(self._chat_wheel_filter)
+        for child in widget.findChildren(QWidget):
+            child.installEventFilter(self._chat_wheel_filter)
+
+    def _on_chat_scroll_target_changed(self, target: int, maximum: int):
+        # Stop auto-follow when the user scrolls up. Resume it only after the
+        # wheel reaches the bottom, so streaming text won't pull the view away.
+        self._follow_stream_output = target >= maximum - 12
+
+    def _on_chat_scrollbar_drag_started(self):
+        self._follow_stream_output = False
+
+    def _on_chat_scrollbar_drag_finished(self):
+        scrollbar = self.scroll.verticalScrollBar()
+        self._follow_stream_output = (
+            scrollbar.maximum() - scrollbar.value() <= 12
+        )
+
+    def _scroll_to_bottom_if_following(self):
+        if self._follow_stream_output:
+            scrollbar = self.scroll.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _resize_bubbles(self):
         width = self._available_bubble_width()
@@ -1747,7 +2280,8 @@ class AssistantWindow(QWidget):
             except RuntimeError:
                 pass
 
-        self._scroll_to_bottom()
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _apply_background_alpha(self):
         alpha = max(
@@ -1762,11 +2296,30 @@ class AssistantWindow(QWidget):
             ),
         )
 
+        saturation = max(
+            0,
+            min(
+                100,
+                int(
+                    self.settings_store.get(
+                        "background_saturation",
+                        DEFAULT_BACKGROUND_SATURATION,
+                    )
+                ),
+            ),
+        ) / 100.0
+        neutral = (18, 18, 22)
+        tinted = (15, 21, 40)
+        red, green, blue = (
+            round(neutral[i] + (tinted[i] - neutral[i]) * saturation)
+            for i in range(3)
+        )
+
         self.setStyleSheet(
             STYLE
             + f"""
             QWidget#mainWindow {{
-                background-color: rgba(17, 19, 29, {alpha});
+                background-color: rgba({red}, {green}, {blue}, {alpha});
                 border: 1px solid rgba(174, 183, 224, 65);
                 border-radius: 22px;
             }}
@@ -1816,6 +2369,16 @@ class AssistantWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
+        if (
+            not self._exit_requested
+            and bool(self.settings_store.get("close_to_tray", False))
+            and self.tray_icon is not None
+            and self.tray_icon.isVisible()
+        ):
+            event.ignore()
+            self.hide()
+            return
+
         self._unregister_hotkey()
 
         if self.audio is not None:
@@ -1823,6 +2386,22 @@ class AssistantWindow(QWidget):
 
         if self.processor is not None:
             self.processor.stop()
+
+        if not self._tts_shutting_down:
+            self._tts_watch_timer.stop()
+            self._tts_resume_listening = False
+            self._tts_shutting_down = True
+            self._tts_operation_id += 1
+            self._tts_operation = None
+            self._tts_future = None
+            try:
+                # Queue stop behind any in-flight launch so it cannot leave a
+                # PowerShell/SAPI process running after the window closes.
+                self._tts_executor.submit(self.speech_output.stop)
+                self._tts_executor.shutdown(wait=False)
+            except RuntimeError:
+                # The executor may already be unavailable during final shutdown.
+                self.speech_output.stop()
 
         audio_running = (
             self.audio is not None and self.audio.isRunning()
@@ -1850,6 +2429,8 @@ class AssistantWindow(QWidget):
 
             return
 
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         event.accept()
 
     def _finish_close_if_ready(self):

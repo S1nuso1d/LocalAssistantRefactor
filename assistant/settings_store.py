@@ -17,19 +17,33 @@ def app_data_dir() -> Path:
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "answer_model": "qwen3-coder:30b",
+    "assistant_mode": "coding",
+    "project_root": "",
+    "project_context_enabled": False,
     "classifier_model": "qwen3-coder:30b",
     "ollama_url": "http://localhost:11434/api/chat",
     "whisper_model": "base",
     "language": "ru",
+    "audio_source": "loopback",
     "audio_device": "По умолчанию",
+    "microphone_device": "По умолчанию",
+    "activation_mode": "continuous",
     "silence_threshold": 0.008,
     "silence_duration": 0.9,
+    "max_phrase_duration": 40.0,
+    "speech_output_enabled": False,
     "hotkey": "ctrl+shift+space",
+    "show_hotkey": "ctrl+shift+a",
     "background_alpha": 224,
+    "background_saturation": 65,
     "compact_mode": False,
     "always_on_top": True,
+    "close_to_tray": False,
     "filter_background_speech": True,
     "require_assistant_name": False,
+    "assistant_names": (
+        "помощник", "ассистент", "чат gpt", "чатгпт", "эй помощник",
+    ),
     "max_history_messages": 16,
 }
 

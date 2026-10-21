@@ -16,7 +16,7 @@ from .config import (
     OLLAMA_URL,
     SYSTEM_PROMPT,
 )
-from .speech_filter import classify_by_rules
+from .speech_filter import classify_by_rules, is_substantive_utterance
 from .settings_store import SettingsStore
 
 logger = logging.getLogger("live_assistant.ollama")
@@ -162,8 +162,40 @@ false — обычный разговор людей между собой, ре
             return True, "принято правилами"
         if result == "reject":
             return False, "отсеяно правилами"
-        if self.classify_ambiguous(text):
+
+        try:
+            accepted = self.classify_ambiguous(text)
+        except OllamaError:
+            # Если локальный классификатор недоступен или вернул некорректный
+            # ответ, не теряем связную пользовательскую реплику. При включённом
+            # требовании имени ассистента настройка остаётся приоритетной.
+            if (
+                not bool(self.settings.get("require_assistant_name", False))
+                and is_substantive_utterance(text)
+            ):
+                logger.warning(
+                    "Классификатор недоступен; фраза принята резервным правилом: %s",
+                    text,
+                )
+                return True, "принято резервным правилом"
+            raise
+
+        if accepted:
             return True, "принято локальной моделью"
+
+        # Контекстный классификатор может ошибочно принять продолжение диалога
+        # за фоновую речь. При отключённом требовании имени ассистента длинная
+        # связная реплика имеет приоритет над отрицательным ответом модели.
+        if (
+            not bool(self.settings.get("require_assistant_name", False))
+            and is_substantive_utterance(text)
+        ):
+            logger.info(
+                "Отрицательный ответ классификатора переопределён правилом содержательной фразы: %s",
+                text,
+            )
+            return True, "принято резервным правилом"
+
         return False, "отсеяно локальной моделью"
 
     def stream_chat(
@@ -190,6 +222,13 @@ false — обычный разговор людей между собой, ре
                 self._url(), json=payload, stream=True, timeout=(5, timeout)
             )
             self._set_active(response)
+            # Cancellation can happen while requests.post is establishing the
+            # connection, before the response becomes visible to cancel_current.
+            # Re-check immediately after publishing the response to close that
+            # small race instead of waiting for the next streamed line.
+            if cancel_event.is_set():
+                response.close()
+                return
             response.raise_for_status()
 
             for raw_line in response.iter_lines(decode_unicode=True):

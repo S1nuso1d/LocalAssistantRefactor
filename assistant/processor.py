@@ -11,6 +11,8 @@ from PySide6.QtCore import QThread, Signal
 
 from .conversation_store import ConversationStore
 from .config import SYSTEM_PROMPT
+from .coding_mode import build_coding_prompt
+from .project_context import build_project_context_if_enabled
 from .ollama_client import OllamaClient, OllamaError
 from .settings_store import SettingsStore
 from .speech_filter import DuplicateFilter
@@ -19,8 +21,9 @@ logger = logging.getLogger("live_assistant.processor")
 
 
 class MessageProcessor(QThread):
-    user_message = Signal(str)
+    user_message = Signal(str, int)
     assistant_message = Signal(str)
+    assistant_error = Signal(str, bool)
     assistant_chunk = Signal(str)
     answer_metadata = Signal(str, int)
     typing_changed = Signal(bool)
@@ -86,6 +89,23 @@ class MessageProcessor(QThread):
     def regenerate_last_answer(self) -> None:
         self._queue.put(("REGENERATE", None))
 
+    def edit_last_user_message(self, text: str) -> None:
+        """Compatibility shortcut for editing the last user message."""
+        text = text.strip()
+        if text:
+            self.cancel_current()
+            self._queue.put(("EDIT_LAST", text))
+
+    def edit_user_message(self, message_id: int, text: str) -> None:
+        """Edit a specific user turn and regenerate the conversation from there."""
+        text = text.strip()
+        if text:
+            self.cancel_current()
+            self._queue.put(("EDIT_MESSAGE", (int(message_id), text)))
+
+    def toggle_pin_current_conversation(self) -> None:
+        self._queue.put(("PIN", None))
+
     def cancel_current(self) -> None:
         with self._cancel_lock:
             if self._cancel_event is not None:
@@ -93,8 +113,13 @@ class MessageProcessor(QThread):
         self._client.cancel_active_request()
 
     def stop(self) -> None:
-        self._running = False
-        self.cancel_current()
+        """Stop accepting work and cancel an active request without a shutdown race."""
+        with self._cancel_lock:
+            self._running = False
+            cancel_event = self._cancel_event
+            if cancel_event is not None:
+                cancel_event.set()
+        self._client.cancel_active_request()
         self._queue.put(None)
 
     def list_conversations(self, query: str = "") -> list[dict[str, Any]]:
@@ -130,9 +155,32 @@ class MessageProcessor(QThread):
             self._conversation_id,
             int(self.settings.get("max_history_messages", 16)),
         )
-        return [{"role": "system", "content": str(self.settings.get("system_prompt", SYSTEM_PROMPT))}] + messages
+        latest_user = next(
+            (str(item["content"]) for item in reversed(messages) if item["role"] == "user"),
+            "",
+        )
+        system_parts = [
+            str(self.settings.get("system_prompt", SYSTEM_PROMPT)),
+            build_coding_prompt(
+                latest_user,
+                str(self.settings.get("assistant_mode", "coding")),
+            ),
+        ]
+        project_root = str(self.settings.get("project_root", "") or "").strip()
+        project_context = build_project_context_if_enabled(
+            project_root,
+            bool(self.settings.get("project_context_enabled", False)),
+        )
+        if project_context:
+            system_parts.append(project_context)
+        system_content = "\n\n".join(part for part in system_parts if part)
+        return [{"role": "system", "content": system_content}] + messages
 
     def _run_message(self, text: str, bypass_filter: bool, persist_user: bool = True) -> None:
+        with self._cancel_lock:
+            if not self._running:
+                return
+
         if not bypass_filter:
             if self._duplicates.is_duplicate(text):
                 logger.info("Повтор голосовой фразы пропущен: %s", text)
@@ -145,20 +193,34 @@ class MessageProcessor(QThread):
                     logger.info("Решение фильтра (%s): %s", reason, text)
                 except OllamaError as exc:
                     logger.exception("Ошибка классификации неоднозначной фразы.")
-                    self.status_changed.emit("Ошибка классификатора")
-                    self.assistant_message.emit(f"Ошибка классификатора: {exc}")
+                    if self._running:
+                        self.status_changed.emit("Ошибка классификатора")
+                        # No user turn has been saved yet, so this error cannot
+                        # be retried as a response to the current phrase.
+                        self.assistant_error.emit(
+                            f"Ошибка классификатора: {exc}", False
+                        )
                     return
                 if not accepted:
                     self.status_changed.emit(f"Фраза пропущена фильтром: {reason}")
                     return
 
         if persist_user:
-            self.store.add_message(self._conversation_id, "user", text)
-            self.user_message.emit(text)
+            with self._cancel_lock:
+                if not self._running:
+                    return
+                message_id = self.store.add_message(
+                    self._conversation_id, "user", text
+                )
+            self.user_message.emit(text, message_id)
             self._emit_saved_conversations()
 
         cancel_event = threading.Event()
         with self._cancel_lock:
+            # stop() uses the same lock. If shutdown wins the race, do not
+            # create a fresh request after the active request was cancelled.
+            if not self._running:
+                return
             self._cancel_event = cancel_event
 
         self.typing_changed.emit(True)
@@ -196,12 +258,22 @@ class MessageProcessor(QThread):
                 raise OllamaError("Поток завершился без текста ответа.")
         except OllamaError as exc:
             logger.exception("Не удалось получить ответ от Ollama.")
-            self.assistant_message.emit(f"Ошибка ответа: {exc}")
-            self.status_changed.emit("Не удалось получить ответ")
+            if self._running and not cancel_event.is_set():
+                error_text = f"Ошибка ответа: {exc}"
+                self.store.add_message(
+                    self._conversation_id, "error", error_text
+                )
+                self.assistant_error.emit(error_text, True)
+                self.status_changed.emit("Не удалось получить ответ")
         except Exception as exc:
             logger.exception("Неожиданная ошибка обработки сообщения.")
-            self.assistant_message.emit(f"Ошибка обработки: {exc}")
-            self.status_changed.emit("Ошибка обработки сообщения")
+            if self._running and not cancel_event.is_set():
+                error_text = f"Ошибка обработки: {exc}"
+                self.store.add_message(
+                    self._conversation_id, "error", error_text
+                )
+                self.assistant_error.emit(error_text, True)
+                self.status_changed.emit("Ошибка обработки сообщения")
         finally:
             with self._cancel_lock:
                 if self._cancel_event is cancel_event:
@@ -246,27 +318,66 @@ class MessageProcessor(QThread):
                 self._emit_current_conversation()
             self._emit_saved_conversations()
             return
+        if command == "PIN":
+            items = self.store.list_conversations()
+            current = next(
+                (item for item in items if int(item["id"]) == self._conversation_id),
+                None,
+            )
+            if current is not None:
+                pinned = not bool(current.get("is_pinned", 0))
+                self.store.set_pinned(self._conversation_id, pinned)
+                self._emit_saved_conversations()
+                self.status_changed.emit("Диалог закреплён" if pinned else "Диалог откреплён")
+            return
+        if command == "EDIT_MESSAGE":
+            message_id, text = payload
+            text = str(text).strip()
+            if not self.store.edit_user_message(
+                self._conversation_id, int(message_id), text
+            ):
+                self.status_changed.emit("Сообщение больше недоступно для редактирования")
+                return
+            self._duplicates = DuplicateFilter()
+            self._emit_current_conversation()
+            self._run_message(text, bypass_filter=True, persist_user=False)
+            return
+        if command == "EDIT_LAST":
+            text = str(payload).strip()
+            if not self.store.edit_last_user_message(self._conversation_id, text):
+                self.status_changed.emit("Нет вопроса для редактирования")
+                return
+            self._duplicates = DuplicateFilter()
+            self._emit_current_conversation()
+            self._run_message(text, bypass_filter=True, persist_user=False)
+            return
         if command == "REGENERATE":
             text = self.store.last_user_message(self._conversation_id)
             if not text:
                 self.status_changed.emit("Нет сообщения для повторной генерации")
                 return
-            self.store.remove_last_assistant_message(self._conversation_id)
+            self.store.remove_last_response_message(self._conversation_id)
             self._run_message(text, bypass_filter=True, persist_user=False)
             return
 
     def run(self) -> None:
         self._emit_current_conversation()
-        while self._running:
+        while True:
             try:
                 item = self._queue.get(timeout=0.25)
             except queue.Empty:
+                if not self._running:
+                    break
                 continue
-            if item is None:
+
+            # stop() may run while get() is blocked. Re-check after the item
+            # is retrieved so queued messages aren't started during shutdown.
+            if item is None or not self._running:
                 break
+
             command, payload = item
             if command == "MESSAGE":
                 text, bypass_filter = payload
                 self._run_message(text, bypass_filter)
-            else:
+            elif self._running:
                 self._handle_control(command, payload)
