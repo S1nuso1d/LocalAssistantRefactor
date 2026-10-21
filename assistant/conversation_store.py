@@ -204,6 +204,7 @@ class ConversationStore:
             conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
 
     def remove_last_assistant_message(self, conversation_id: int) -> None:
+        """Remove the most recent assistant answer (legacy helper)."""
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT id FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY id DESC LIMIT 1",
@@ -211,6 +212,29 @@ class ConversationStore:
             ).fetchone()
             if row:
                 conn.execute("DELETE FROM messages WHERE id=?", (row["id"],))
+
+    def remove_last_response_message(self, conversation_id: int) -> None:
+        """Remove the latest answer/error belonging to the latest user turn."""
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM messages
+                WHERE conversation_id=?
+                  AND role IN ('assistant', 'error')
+                  AND id > COALESCE(
+                      (SELECT MAX(id) FROM messages
+                       WHERE conversation_id=? AND role='user'),
+                      0
+                  )
+                ORDER BY id DESC LIMIT 1
+                """,
+                (conversation_id, conversation_id),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    "DELETE FROM messages WHERE id=? AND conversation_id=?",
+                    (row["id"], conversation_id),
+                )
 
     def context_messages(self, conversation_id: int, limit: int = 16) -> list[dict[str, str]]:
         with self._connection() as conn:
