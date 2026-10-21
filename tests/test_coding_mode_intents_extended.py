@@ -11,6 +11,18 @@ class ExtendedCodingIntentTests(unittest.TestCase):
             "exercise",
         )
 
+    def test_request_for_a_task_list_is_not_misclassified_as_one_exercise(self):
+        self.assertIsNone(detect_programming_intent("Составь список задач"))
+        self.assertIsNone(
+            detect_programming_intent("Предложи список задач для обучения Python")
+        )
+
+    def test_explicit_request_to_invent_one_exercise_is_still_detected(self):
+        self.assertEqual(
+            detect_programming_intent("Придумай одну задачу про циклы в Python"),
+            "exercise",
+        )
+
     def test_submitted_assignment_is_not_misclassified_as_exercise_request(self):
         task = (
             "У тебя есть список ростов человека в сантиметрах. "
