@@ -16,7 +16,7 @@ from .config import (
     OLLAMA_URL,
     SYSTEM_PROMPT,
 )
-from .speech_filter import classify_by_rules
+from .speech_filter import classify_by_rules, is_substantive_utterance
 from .settings_store import SettingsStore
 
 logger = logging.getLogger("live_assistant.ollama")
@@ -162,7 +162,25 @@ false — обычный разговор людей между собой, ре
             return True, "принято правилами"
         if result == "reject":
             return False, "отсеяно правилами"
-        if self.classify_ambiguous(text):
+
+        try:
+            accepted = self.classify_ambiguous(text)
+        except OllamaError:
+            # Если локальный классификатор недоступен или вернул некорректный
+            # ответ, не теряем связную пользовательскую реплику. При включённом
+            # требовании имени ассистента настройка остаётся приоритетной.
+            if (
+                not bool(self.settings.get("require_assistant_name", False))
+                and is_substantive_utterance(text)
+            ):
+                logger.warning(
+                    "Классификатор недоступен; фраза принята резервным правилом: %s",
+                    text,
+                )
+                return True, "принято резервным правилом"
+            raise
+
+        if accepted:
             return True, "принято локальной моделью"
         return False, "отсеяно локальной моделью"
 
