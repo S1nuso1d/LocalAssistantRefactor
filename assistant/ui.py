@@ -17,7 +17,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QLineEdit, QGraphicsOpacityEffect,
-    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip
+    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
+    QSystemTrayIcon, QStyle
 )
 
 from .audio_worker import AudioWorker
@@ -28,7 +29,7 @@ from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore
 
 
-BUILD_VERSION = "2026.10.21-r6"
+BUILD_VERSION = "2026.10.21-r7"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -803,8 +804,12 @@ class AssistantWindow(QWidget):
         self._stream_timer.timeout.connect(self._flush_stream_text)
 
         self._close_pending = False
+        self._exit_requested = False
         self._hotkey_registered = False
         self._drag_position = None
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self.tray_pause_action = None
 
         self._bubbles: list[ChatBubble] = []
         self._rows: list[QWidget] = []
@@ -829,6 +834,7 @@ class AssistantWindow(QWidget):
         )
 
         self._connect_signals()
+        self._init_system_tray()
         self.audio.start()
         self.processor.start()
         self._register_hotkey()
@@ -836,6 +842,46 @@ class AssistantWindow(QWidget):
         self._apply_compact_mode(
             bool(self.settings_store.get("compact_mode", False))
         )
+
+    def _init_system_tray(self):
+        """Create a Windows notification-area icon when the tray is available."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning("Системный трей недоступен; закрытие в трей отключено.")
+            return
+
+        self.tray_menu = QMenu(self)
+        show_action = self.tray_menu.addAction("Открыть Live Assistant")
+        show_action.triggered.connect(self._show_from_tray)
+
+        self.tray_pause_action = self.tray_menu.addAction(
+            "Приостановить прослушивание"
+        )
+        self.tray_pause_action.triggered.connect(self.toggle_listening)
+
+        self.tray_menu.addSeparator()
+        exit_action = self.tray_menu.addAction("Выход")
+        exit_action.triggered.connect(self._exit_from_tray)
+
+        self.tray_icon = QSystemTrayIcon(
+            QApplication.style().standardIcon(QStyle.SP_ComputerIcon), self
+        )
+        self.tray_icon.setToolTip("Live Assistant")
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_from_tray()
+
+    def _exit_from_tray(self):
+        self._exit_requested = True
+        self.close()
 
     def _set_window_flags(self):
         flags = Qt.Window | Qt.FramelessWindowHint
@@ -1734,6 +1780,14 @@ class AssistantWindow(QWidget):
         self.listen_button.style().unpolish(self.listen_button)
         self.listen_button.style().polish(self.listen_button)
         self.listen_button.update()
+        self._update_tray_pause_action(enabled)
+
+    def _update_tray_pause_action(self, enabled: bool):
+        if self.tray_pause_action is not None:
+            self.tray_pause_action.setText(
+                "Приостановить прослушивание"
+                if enabled else "Возобновить прослушивание"
+            )
 
     def toggle_listening(self):
         self.audio.set_listening(not self.audio.listening)
@@ -1762,11 +1816,22 @@ class AssistantWindow(QWidget):
             ),
         )
 
+        saturation = max(
+            0,
+            min(100, int(self.settings_store.get("background_saturation", 65))),
+        ) / 100.0
+        neutral = (18, 18, 22)
+        tinted = (17, 19, 29)
+        red, green, blue = (
+            round(neutral[i] + (tinted[i] - neutral[i]) * saturation)
+            for i in range(3)
+        )
+
         self.setStyleSheet(
             STYLE
             + f"""
             QWidget#mainWindow {{
-                background-color: rgba(17, 19, 29, {alpha});
+                background-color: rgba({red}, {green}, {blue}, {alpha});
                 border: 1px solid rgba(174, 183, 224, 65);
                 border-radius: 22px;
             }}
@@ -1816,6 +1881,16 @@ class AssistantWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
+        if (
+            not self._exit_requested
+            and bool(self.settings_store.get("close_to_tray", False))
+            and self.tray_icon is not None
+            and self.tray_icon.isVisible()
+        ):
+            event.ignore()
+            self.hide()
+            return
+
         self._unregister_hotkey()
 
         if self.audio is not None:
@@ -1850,6 +1925,8 @@ class AssistantWindow(QWidget):
 
             return
 
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         event.accept()
 
     def _finish_close_if_ready(self):
