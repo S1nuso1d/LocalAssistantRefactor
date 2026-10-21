@@ -38,7 +38,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r14"
+BUILD_VERSION = "2026.10.21-r15"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -2387,20 +2387,21 @@ class AssistantWindow(QWidget):
         if self.processor is not None:
             self.processor.stop()
 
-        self._tts_watch_timer.stop()
-        self._tts_resume_listening = False
-        self._tts_shutting_down = True
-        self._tts_operation_id += 1
-        self._tts_operation = None
-        self._tts_future = None
-        try:
-            # Queue stop behind any in-flight launch so it cannot leave a
-            # PowerShell/SAPI process running after the window closes.
-            self._tts_executor.submit(self.speech_output.stop)
-            self._tts_executor.shutdown(wait=False)
-        except RuntimeError:
-            # The executor may already have been shut down by a prior close event.
-            self.speech_output.stop()
+        if not self._tts_shutting_down:
+            self._tts_watch_timer.stop()
+            self._tts_resume_listening = False
+            self._tts_shutting_down = True
+            self._tts_operation_id += 1
+            self._tts_operation = None
+            self._tts_future = None
+            try:
+                # Queue stop behind any in-flight launch so it cannot leave a
+                # PowerShell/SAPI process running after the window closes.
+                self._tts_executor.submit(self.speech_output.stop)
+                self._tts_executor.shutdown(wait=False)
+            except RuntimeError:
+                # The executor may already be unavailable during final shutdown.
+                self.speech_output.stop()
 
         audio_running = (
             self.audio is not None and self.audio.isRunning()
