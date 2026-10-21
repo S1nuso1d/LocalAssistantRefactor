@@ -40,6 +40,28 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(messages[-1]["role"], "user")
             self.assertEqual(messages[-1]["content"], "Исправленный вопрос")
 
+    def test_saved_errors_are_visible_but_excluded_from_model_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory) / "history.sqlite3")
+            conversation_id = store.create_conversation()
+            store.add_message(conversation_id, "user", "Посчитай средний рост")
+            store.add_message(conversation_id, "error", "Ошибка ответа: Ollama недоступна")
+
+            visible = store.get_messages(conversation_id)
+            context = store.context_messages(conversation_id, 10)
+
+            self.assertEqual([item["role"] for item in visible], ["user", "error"])
+            self.assertEqual(
+                context,
+                [{"role": "user", "content": "Посчитай средний рост"}],
+            )
+
+            store.remove_last_response_message(conversation_id)
+            self.assertEqual(
+                [item["role"] for item in store.get_messages(conversation_id)],
+                ["user"],
+            )
+
     def test_rules_and_duplicate_filter(self):
         self.assertEqual(classify_by_rules("Объясни, что делает цикл"), "accept")
         self.assertEqual(classify_by_rules("ага"), "reject")
