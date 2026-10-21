@@ -803,7 +803,7 @@ class AssistantWindow(QWidget):
         self._pending_stream_text = ""
 
         self._stream_timer = QTimer(self)
-        self._stream_timer.setInterval(45)
+        self._stream_timer.setInterval(80)
         self._stream_timer.timeout.connect(self._flush_stream_text)
 
         self._close_pending = False
@@ -1832,7 +1832,7 @@ class AssistantWindow(QWidget):
             ),
         ) / 100.0
         neutral = (18, 18, 22)
-        tinted = (17, 19, 29)
+        tinted = (15, 21, 40)
         red, green, blue = (
             round(neutral[i] + (tinted[i] - neutral[i]) * saturation)
             for i in range(3)
