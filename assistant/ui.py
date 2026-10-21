@@ -10,7 +10,8 @@ from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QEvent, QObject, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
+    Qt, QAbstractAnimation, QEvent, QObject, QTimer,
+    QPropertyAnimation, QEasingCurve, Signal, QPointF
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
@@ -846,23 +847,55 @@ class TypingBubble(QFrame):
 
 
 class ChatWheelFilter(QObject):
-    """Route mouse-wheel input over chat messages to the chat scroll area."""
+    """Smoothly route wheel input over chat widgets to the chat scroll area."""
+
+    scroll_target_changed = Signal(int, int)
 
     def __init__(self, scroll_area: QScrollArea):
         super().__init__(scroll_area)
         self.scroll_area = scroll_area
+        self._animation = QPropertyAnimation(
+            scroll_area.verticalScrollBar(), b"value", self
+        )
+        self._animation.setDuration(115)
+        self._animation.setEasingCurve(QEasingCurve.OutCubic)
 
     def eventFilter(self, watched, event):
         if event.type() == QEvent.Type.Wheel:
-            delta = event.pixelDelta().y()
-            if not delta:
-                delta = event.angleDelta().y()
+            pixel_delta = event.pixelDelta().y()
+            angle_delta = event.angleDelta().y()
 
-            if delta:
-                scrollbar = self.scroll_area.verticalScrollBar()
-                scrollbar.setValue(scrollbar.value() - int(delta))
-                event.accept()
-                return True
+            if pixel_delta:
+                distance = float(pixel_delta)
+            elif angle_delta:
+                # One standard wheel notch should move a few text lines,
+                # not jump by the raw 120-point Qt angle value.
+                distance = (float(angle_delta) / 120.0) * 76.0
+            else:
+                return super().eventFilter(watched, event)
+
+            scrollbar = self.scroll_area.verticalScrollBar()
+            maximum = scrollbar.maximum()
+            target_base = scrollbar.value()
+            if self._animation.state() == QAbstractAnimation.State.Running:
+                end_value = self._animation.endValue()
+                if end_value is not None:
+                    try:
+                        target_base = int(end_value)
+                    except (TypeError, ValueError):
+                        pass
+
+            target = max(
+                0,
+                min(maximum, int(round(target_base - distance))),
+            )
+            self._animation.stop()
+            self._animation.setStartValue(scrollbar.value())
+            self._animation.setEndValue(target)
+            self._animation.start()
+            self.scroll_target_changed.emit(target, maximum)
+            event.accept()
+            return True
 
         return super().eventFilter(watched, event)
 
@@ -887,6 +920,7 @@ class AssistantWindow(QWidget):
         self.processor: MessageProcessor | None = None
 
         self._acrylic_enabled = False
+        self._follow_stream_output = True
         self._typing_bubble: TypingBubble | None = None
         self._typing_row: QWidget | None = None
         self._streaming_bubble: ChatBubble | None = None
@@ -1095,6 +1129,17 @@ class AssistantWindow(QWidget):
 
         self.scroll = QScrollArea()
         self._chat_wheel_filter = ChatWheelFilter(self.scroll)
+        self._chat_wheel_filter.scroll_target_changed.connect(
+            self._on_chat_scroll_target_changed
+        )
+        self.scroll.installEventFilter(self._chat_wheel_filter)
+        self.scroll.viewport().installEventFilter(self._chat_wheel_filter)
+        self.scroll.verticalScrollBar().sliderPressed.connect(
+            self._on_chat_scrollbar_drag_started
+        )
+        self.scroll.verticalScrollBar().sliderReleased.connect(
+            self._on_chat_scrollbar_drag_finished
+        )
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -1102,6 +1147,7 @@ class AssistantWindow(QWidget):
 
         self.chat_content = QWidget()
         self.chat_content.setStyleSheet("background: transparent;")
+        self.chat_content.installEventFilter(self._chat_wheel_filter)
 
         self.chat_layout = QVBoxLayout(self.chat_content)
         self.chat_layout.setContentsMargins(5, 8, 5, 9)
@@ -1520,7 +1566,8 @@ class AssistantWindow(QWidget):
                 text, "system" if is_error else "assistant"
             )
 
-        self._scroll_to_bottom()
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
         if not is_error and bool(self.settings_store.get("speech_output_enabled", False)):
             self._speak_text(text)
 
@@ -1564,8 +1611,10 @@ class AssistantWindow(QWidget):
         self._streaming_text += self._pending_stream_text
         self._pending_stream_text = ""
 
+        should_follow = self._follow_stream_output
         self._streaming_bubble.set_markdown(self._streaming_text)
-        self._scroll_to_bottom()
+        if should_follow:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _add_actions_to_existing_stream(self):
         if self._stream_timer.isActive():
@@ -2131,6 +2180,25 @@ class AssistantWindow(QWidget):
         for child in widget.findChildren(QWidget):
             child.installEventFilter(self._chat_wheel_filter)
 
+    def _on_chat_scroll_target_changed(self, target: int, maximum: int):
+        # Stop auto-follow when the user scrolls up. Resume it only after the
+        # wheel reaches the bottom, so streaming text won't pull the view away.
+        self._follow_stream_output = target >= maximum - 12
+
+    def _on_chat_scrollbar_drag_started(self):
+        self._follow_stream_output = False
+
+    def _on_chat_scrollbar_drag_finished(self):
+        scrollbar = self.scroll.verticalScrollBar()
+        self._follow_stream_output = (
+            scrollbar.maximum() - scrollbar.value() <= 12
+        )
+
+    def _scroll_to_bottom_if_following(self):
+        if self._follow_stream_output:
+            scrollbar = self.scroll.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
     def _resize_bubbles(self):
         width = self._available_bubble_width()
 
@@ -2140,7 +2208,8 @@ class AssistantWindow(QWidget):
             except RuntimeError:
                 pass
 
-        self._scroll_to_bottom()
+        if self._follow_stream_output:
+            QTimer.singleShot(0, self._scroll_to_bottom_if_following)
 
     def _apply_background_alpha(self):
         alpha = max(
