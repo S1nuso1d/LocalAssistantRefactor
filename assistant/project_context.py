@@ -103,7 +103,7 @@ def build_project_context(root: str | Path) -> str:
     )
 
  
-def build_project_context_if_enabled(root: str | Path, enabled: bool = True) -> str:
+def build_project_context_if_enabled(root: str | Path, enabled: bool = False) -> str:
     """Build project context only after the user has enabled this setting."""
     if not enabled or not str(root or "").strip():
         return ""
