@@ -1,40 +1,35 @@
-"""Tests for the explicit project-context setting."""
+"""Tests for explicit opt-in to include selected project files in model context."""
 import tempfile
 import unittest
 from pathlib import Path
 
-from assistant.conversation_store import ConversationStore
-from assistant.processor import MessageProcessor
-from assistant.settings_store import SettingsStore
+from assistant.project_context import build_project_context_if_enabled
 
 
 class ProjectContextToggleTests(unittest.TestCase):
     def test_project_files_are_only_added_when_context_is_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
+            project = Path(directory) / "project"
             project.mkdir()
             (project / "example.py").write_text(
                 "def hello():\n    return 'project context marker'\n",
                 encoding="utf-8",
             )
 
-            settings = SettingsStore(root / "settings.json")
-            settings.update({
-                "project_root": str(project),
-                "project_context_enabled": False,
-            })
-            store = ConversationStore(root / "history.sqlite3")
-            processor = MessageProcessor(settings, store)
+            disabled_context = build_project_context_if_enabled(project, False)
+            self.assertEqual(disabled_context, "")
 
-            disabled_context = processor._make_context()[0]["content"]
-            self.assertNotIn("FILE: example.py", disabled_context)
-            self.assertNotIn("project context marker", disabled_context)
-
-            settings.update({"project_context_enabled": True})
-            enabled_context = processor._make_context()[0]["content"]
+            enabled_context = build_project_context_if_enabled(project, True)
             self.assertIn("FILE: example.py", enabled_context)
             self.assertIn("project context marker", enabled_context)
+
+    def test_empty_or_missing_root_returns_empty_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(build_project_context_if_enabled("", True), "")
+            self.assertEqual(
+                build_project_context_if_enabled(Path(directory) / "missing", True),
+                "",
+            )
 
 
 if __name__ == "__main__":
