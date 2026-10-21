@@ -12,7 +12,7 @@ from PySide6.QtCore import QThread, Signal
 from .conversation_store import ConversationStore
 from .config import SYSTEM_PROMPT
 from .coding_mode import build_coding_prompt
-from .project_context import build_project_context
+from .project_context import build_project_context_if_enabled
 from .ollama_client import OllamaClient, OllamaError
 from .settings_store import SettingsStore
 from .speech_filter import DuplicateFilter
@@ -161,13 +161,12 @@ class MessageProcessor(QThread):
             ),
         ]
         project_root = str(self.settings.get("project_root", "") or "").strip()
-        use_project_context = bool(
-            self.settings.get("project_context_enabled", True)
+        project_context = build_project_context_if_enabled(
+            project_root,
+            bool(self.settings.get("project_context_enabled", True)),
         )
-        if project_root and use_project_context:
-            project_context = build_project_context(project_root)
-            if project_context:
-                system_parts.append(project_context)
+        if project_context:
+            system_parts.append(project_context)
         system_content = "\n\n".join(part for part in system_parts if part)
         return [{"role": "system", "content": system_content}] + messages
 
