@@ -128,6 +128,20 @@ class SettingsDialog(QDialog):
         opacity_layout.addWidget(self.opacity_label)
         form.addRow("Плотность тёмного стекла", opacity_layout)
 
+        saturation_layout = QHBoxLayout()
+        self.saturation = QSlider(Qt.Horizontal)
+        self.saturation.setRange(0, 100)
+        self.saturation.setValue(
+            max(0, min(100, int(settings.get("background_saturation", 65))))
+        )
+        self.saturation_label = QLabel(f"{self.saturation.value()}%")
+        self.saturation.valueChanged.connect(
+            lambda n: self.saturation_label.setText(f"{n}%")
+        )
+        saturation_layout.addWidget(self.saturation, 1)
+        saturation_layout.addWidget(self.saturation_label)
+        form.addRow("Насыщенность оттенка фона", saturation_layout)
+
         self.filter_speech = QCheckBox("Фильтровать фоновую речь")
         self.filter_speech.setChecked(bool(settings.get("filter_background_speech", True)))
         form.addRow("Голос", self.filter_speech)
@@ -143,6 +157,12 @@ class SettingsDialog(QDialog):
         self.always_on_top = QCheckBox("Закреплять окно поверх других окон")
         self.always_on_top.setChecked(bool(settings.get("always_on_top", True)))
         form.addRow("Поведение окна", self.always_on_top)
+
+        self.close_to_tray = QCheckBox(
+            "При закрытии окна продолжать работу в системном трее"
+        )
+        self.close_to_tray.setChecked(bool(settings.get("close_to_tray", False)))
+        form.addRow("Системный трей", self.close_to_tray)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setObjectName("save")
@@ -162,10 +182,12 @@ class SettingsDialog(QDialog):
             "silence_duration": float(self.silence.value()),
             "hotkey": self.hotkey.text().strip() or "ctrl+shift+space",
             "background_alpha": int(self.opacity.value()),
+            "background_saturation": int(self.saturation.value()),
             "filter_background_speech": self.filter_speech.isChecked(),
             "require_assistant_name": self.require_name.isChecked(),
             "compact_mode": self.compact_mode.isChecked(),
             "always_on_top": self.always_on_top.isChecked(),
+            "close_to_tray": self.close_to_tray.isChecked(),
         }
         try:
             self.settings.update(values)
