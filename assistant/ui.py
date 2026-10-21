@@ -38,7 +38,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r15"
+BUILD_VERSION = "2026.10.21-r16"
 logger = logging.getLogger("live_assistant.ui")
 
 
