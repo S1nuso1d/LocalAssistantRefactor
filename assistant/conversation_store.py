@@ -139,32 +139,50 @@ class ConversationStore:
                 (1 if pinned else 0, time.time(), conversation_id),
             )
 
-    def edit_last_user_message(self, conversation_id: int, content: str) -> bool:
+    def edit_user_message(
+        self, conversation_id: int, message_id: int, content: str
+    ) -> bool:
+        """Edit one user message and discard later turns that depended on it."""
         content = content.strip()
         if not content:
             return False
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT id FROM messages WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 1",
-                (conversation_id,),
+                "SELECT id FROM messages "
+                "WHERE id=? AND conversation_id=? AND role='user'",
+                (int(message_id), int(conversation_id)),
             ).fetchone()
             if row is None:
                 return False
-            message_id = int(row["id"])
+
+            now = time.time()
             conn.execute(
-                "UPDATE messages SET content=?, created_at=? WHERE id=?",
-                (content, time.time(), message_id),
+                "UPDATE messages SET content=?, created_at=? "
+                "WHERE id=? AND conversation_id=?",
+                (content, now, int(message_id), int(conversation_id)),
             )
-            # Remove generated response and later turns based on the old question.
+            # Responses and questions after this message depend on its old content.
             conn.execute(
                 "DELETE FROM messages WHERE conversation_id=? AND id>?",
-                (conversation_id, message_id),
+                (int(conversation_id), int(message_id)),
             )
             conn.execute(
                 "UPDATE conversations SET updated_at=? WHERE id=?",
-                (time.time(), conversation_id),
+                (now, int(conversation_id)),
             )
             return True
+
+    def edit_last_user_message(self, conversation_id: int, content: str) -> bool:
+        """Backward-compatible helper for editing the most recent user message."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 1",
+                (int(conversation_id),),
+            ).fetchone()
+        if row is None:
+            return False
+        return self.edit_user_message(conversation_id, int(row["id"]), content)
 
     def clear_conversation(self, conversation_id: int) -> None:
         with self._connection() as conn:
