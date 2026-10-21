@@ -11,7 +11,7 @@ import threading
 def plain_text_for_speech(markdown: str, limit: int = 12000) -> str:
     """Remove code blocks and common Markdown syntax before speaking."""
     text = re.sub(r"\x60{3}.*?\x60{3}", " Блок кода пропущен. ", markdown or "", flags=re.DOTALL)
-    text = re.sub(r"!?[([^]]+)]([^)]+)", r"\1", text)
+    text = re.sub(r"!?\[([^]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
     text = re.sub(r"(?m)^\s*[-*+]\s+", "", text)
     text = re.sub(r"[*_\x60~]", "", text)

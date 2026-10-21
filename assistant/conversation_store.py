@@ -166,7 +166,7 @@ class ConversationStore:
             )
             return True
 
-    def clear_conversation(self, conversation_id: int) -> None
+    def clear_conversation(self, conversation_id: int) -> None:
         with self._connection() as conn:
             conn.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
             conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (time.time(), conversation_id))
