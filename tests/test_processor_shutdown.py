@@ -1,9 +1,35 @@
 """Regression test for stopping the message processor while its queue is being read."""
 import queue
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
+
+# PySide6 is not required by the headless CI suite. Provide only the tiny
+# QThread/Signal surface needed for this deterministic direct-call unit test.
+try:
+    from PySide6.QtCore import QThread as _QThread
+except ModuleNotFoundError as exc:
+    if exc.name not in {"PySide6", "PySide6.QtCore"}:
+        raise
+
+    class _TestSignal:
+        def emit(self, *_args, **_kwargs):
+            pass
+
+    class _TestQThread:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    _qtcore = types.ModuleType("PySide6.QtCore")
+    _qtcore.QThread = _TestQThread
+    _qtcore.Signal = lambda *_args, **_kwargs: _TestSignal()
+    _pyside = types.ModuleType("PySide6")
+    _pyside.QtCore = _qtcore
+    sys.modules.setdefault("PySide6", _pyside)
+    sys.modules["PySide6.QtCore"] = _qtcore
 
 from assistant.conversation_store import ConversationStore
 from assistant.processor import MessageProcessor
@@ -39,8 +65,8 @@ class ProcessorShutdownTests(unittest.TestCase):
             processor._queue.put(("MESSAGE", ("Do not start this request", True)))
             processor._run_message = Mock()
 
-            # Call the QThread run method synchronously to make the race
-            # deterministic and avoid starting a real worker thread in tests.
+            # Call QThread.run synchronously to make the race deterministic and
+            # avoid starting a real worker thread in this unit test.
             processor.run()
 
             processor._run_message.assert_not_called()
