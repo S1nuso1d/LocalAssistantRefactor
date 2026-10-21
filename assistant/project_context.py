@@ -101,3 +101,10 @@ def build_project_context(root: str | Path) -> str:
         "Не запускай команды и не изменяй файлы самовольно.\n\n"
         + "\n\n".join(sections)
     )
+
+ 
+def build_project_context_if_enabled(root: str | Path, enabled: bool = True) -> str:
+    """Build project context only after the user has enabled this setting."""
+    if not enabled or not str(root or "").strip():
+        return ""
+    return build_project_context(root)
