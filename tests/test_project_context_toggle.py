@@ -18,6 +18,7 @@ class ProjectContextToggleTests(unittest.TestCase):
 
             disabled_context = build_project_context_if_enabled(project, False)
             self.assertEqual(disabled_context, "")
+            self.assertEqual(build_project_context_if_enabled(project), "")
 
             enabled_context = build_project_context_if_enabled(project, True)
             self.assertIn("FILE: example.py", enabled_context)
