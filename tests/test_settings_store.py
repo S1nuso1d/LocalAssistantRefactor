@@ -14,7 +14,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SETTINGS["background_saturation"], 65)
         self.assertFalse(DEFAULT_SETTINGS["close_to_tray"])
         self.assertIn("project_context_enabled", DEFAULT_SETTINGS)
-        self.assertTrue(DEFAULT_SETTINGS["project_context_enabled"])
+        self.assertFalse(DEFAULT_SETTINGS["project_context_enabled"])
         self.assertEqual(DEFAULT_SETTINGS["show_hotkey"], "ctrl+shift+a")
 
     def test_appearance_and_tray_settings_survive_restart(self):
