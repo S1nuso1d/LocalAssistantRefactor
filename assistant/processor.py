@@ -163,7 +163,7 @@ class MessageProcessor(QThread):
         project_root = str(self.settings.get("project_root", "") or "").strip()
         project_context = build_project_context_if_enabled(
             project_root,
-            bool(self.settings.get("project_context_enabled", True)),
+            bool(self.settings.get("project_context_enabled", False)),
         )
         if project_context:
             system_parts.append(project_context)
