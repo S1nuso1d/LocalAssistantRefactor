@@ -1117,11 +1117,12 @@ class AssistantWindow(QWidget):
         self.listen_button.setProperty("active", "true")
         self.listen_button.clicked.connect(self.toggle_listening)
 
-        help_label = QLabel(f"Горячая клавиша: {self.settings_store.get('hotkey', 'ctrl+shift+space')}")
-        help_label.setObjectName("tiny")
+        self.hotkey_hint = QLabel()
+        self.hotkey_hint.setObjectName("tiny")
+        self._update_hotkey_hint()
 
         footer.addWidget(self.listen_button)
-        footer.addWidget(help_label)
+        footer.addWidget(self.hotkey_hint)
         footer.addStretch(1)
 
         self.resize_grip = QSizeGrip(self)
@@ -1977,6 +1978,7 @@ class AssistantWindow(QWidget):
         self._set_window_flags()
         self.show()
 
+        self._update_hotkey_hint()
         self._unregister_hotkey()
         if before.get("activation_mode") != after.get("activation_mode") and self.audio is not None:
             self.audio.set_listening(after.get("activation_mode") == "continuous")
@@ -2028,6 +2030,22 @@ class AssistantWindow(QWidget):
             self.resize(570, 730)
 
         QTimer.singleShot(0, self._resize_bubbles)
+
+    def _update_hotkey_hint(self):
+        voice_hotkey = str(
+            self.settings_store.get("hotkey", "ctrl+shift+space")
+        ).strip()
+        show_hotkey = str(
+            self.settings_store.get("show_hotkey", "ctrl+shift+a")
+        ).strip()
+        self.hotkey_hint.setText(
+            f"Голос: {voice_hotkey} · Окно: {show_hotkey}"
+        )
+        self.hotkey_hint.setToolTip(
+            "Голос: переключить прослушивание (или удерживать для PTT).\n"
+            "Окно: показать помощника и перейти к вводу.\n"
+            "Ctrl+L — ввод · Ctrl+N — новый чат · Esc — остановить ответ/озвучивание."
+        )
 
     def _update_status(self, text: str):
         self.status_label.setText(text)
