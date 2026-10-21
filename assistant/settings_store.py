@@ -41,6 +41,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "close_to_tray": False,
     "filter_background_speech": True,
     "require_assistant_name": False,
+    "assistant_names": (
+        "помощник", "ассистент", "чат gpt", "чатгпт", "эй помощник",
+    ),
     "max_history_messages": 16,
 }
 
