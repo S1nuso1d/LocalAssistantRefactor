@@ -1208,7 +1208,7 @@ class AssistantWindow(QWidget):
 
     @staticmethod
     def _normalized_hotkey(value: str) -> str:
-        return re.sub(r"\\s+", "", (value or "").strip().lower())
+        return re.sub(r"\s+", "", (value or "").strip().lower())
 
     def _register_hotkey(self):
         self._hotkey_handles.clear()
