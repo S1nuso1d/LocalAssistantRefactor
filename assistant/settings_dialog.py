@@ -110,7 +110,7 @@ class SettingsDialog(QDialog):
             "Передавать содержимое выбранного проекта модели"
         )
         self.project_context_enabled.setChecked(
-            bool(settings.get("project_context_enabled", True))
+            bool(settings.get("project_context_enabled", False))
         )
         form.addRow("", self.project_context_enabled)
 
