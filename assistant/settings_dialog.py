@@ -105,7 +105,14 @@ class SettingsDialog(QDialog):
         project_row.addWidget(self.project_root, 1)
         project_row.addWidget(browse_project)
         project_row.addWidget(clear_project)
-        form.addRow("Контекст проекта", project_row)
+        form.addRow("Папка проекта для чтения", project_row)
+        self.project_context_enabled = QCheckBox(
+            "Передавать содержимое выбранного проекта модели"
+        )
+        self.project_context_enabled.setChecked(
+            bool(settings.get("project_context_enabled", True))
+        )
+        form.addRow("", self.project_context_enabled)
 
         form = voice_form
         self.language = QComboBox()
@@ -181,7 +188,13 @@ class SettingsDialog(QDialog):
 
         self.hotkey = QLineEdit(str(settings.get("hotkey", "ctrl+shift+space")))
         self.hotkey.setPlaceholderText("ctrl+shift+space")
-        form.addRow("Горячая клавиша", self.hotkey)
+        form.addRow("Горячая клавиша прослушивания", self.hotkey)
+
+        self.show_hotkey = QLineEdit(
+            str(settings.get("show_hotkey", "ctrl+shift+a"))
+        )
+        self.show_hotkey.setPlaceholderText("ctrl+shift+a")
+        form.addRow("Глобальный вызов помощника", self.show_hotkey)
 
         self.activation_mode = QComboBox()
         self.activation_mode.addItem("Постоянное прослушивание", "continuous")
@@ -265,6 +278,7 @@ class SettingsDialog(QDialog):
             "answer_model": self.answer_model.currentText(),
             "assistant_mode": self.assistant_mode.currentData(),
             "project_root": self.project_root.text().strip(),
+            "project_context_enabled": self.project_context_enabled.isChecked(),
             "classifier_model": self.classifier_model.currentText(),
             "language": self.language.currentData(),
             "whisper_model": self.whisper_model.currentText(),
@@ -277,6 +291,7 @@ class SettingsDialog(QDialog):
             "silence_threshold": float(self.threshold.value()),
             "silence_duration": float(self.silence.value()),
             "hotkey": self.hotkey.text().strip() or "ctrl+shift+space",
+            "show_hotkey": self.show_hotkey.text().strip() or "ctrl+shift+a",
             "background_alpha": int(self.opacity.value()),
             "background_saturation": int(self.saturation.value()),
             "filter_background_speech": self.filter_speech.isChecked(),
