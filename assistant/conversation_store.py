@@ -42,7 +42,8 @@ class ConversationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    is_pinned INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +59,10 @@ class ConversationStore:
                 CREATE INDEX IF NOT EXISTS idx_conversations_updated
                     ON conversations(updated_at DESC);
             """)
+            # Keep existing history when opening databases from older builds.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+            if "is_pinned" not in columns:
+                conn.execute("ALTER TABLE conversations ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
 
     def create_conversation(self, title: str = "Новый диалог") -> int:
         now = time.time()
@@ -79,15 +84,15 @@ class ConversationStore:
             if query:
                 like = f"%{query}%"
                 rows = conn.execute("""
-                    SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at
+                    SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at, c.is_pinned
                     FROM conversations c
                     LEFT JOIN messages m ON m.conversation_id=c.id
                     WHERE c.title LIKE ? OR m.content LIKE ?
-                    ORDER BY c.updated_at DESC LIMIT ?
+                    ORDER BY c.is_pinned DESC, c.updated_at DESC LIMIT ?
                 """, (like, like, limit)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT ?",
+                    "SELECT id, title, created_at, updated_at, is_pinned FROM conversations ORDER BY is_pinned DESC, updated_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         return [dict(row) for row in rows]
@@ -127,7 +132,41 @@ class ConversationStore:
                         )
             return int(cur.lastrowid)
 
-    def clear_conversation(self, conversation_id: int) -> None:
+    def set_pinned(self, conversation_id: int, pinned: bool) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE conversations SET is_pinned=?, updated_at=? WHERE id=?",
+                (1 if pinned else 0, time.time(), conversation_id),
+            )
+
+    def edit_last_user_message(self, conversation_id: int, content: str) -> bool:
+        content = content.strip()
+        if not content:
+            return False
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM messages WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            message_id = int(row["id"])
+            conn.execute(
+                "UPDATE messages SET content=?, created_at=? WHERE id=?",
+                (content, time.time(), message_id),
+            )
+            # Remove generated response and later turns based on the old question.
+            conn.execute(
+                "DELETE FROM messages WHERE conversation_id=? AND id>?",
+                (conversation_id, message_id),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (time.time(), conversation_id),
+            )
+            return True
+
+    def clear_conversation(self, conversation_id: int) -> None
         with self._connection() as conn:
             conn.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
             conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (time.time(), conversation_id))

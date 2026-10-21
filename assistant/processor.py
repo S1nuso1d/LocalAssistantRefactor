@@ -11,6 +11,8 @@ from PySide6.QtCore import QThread, Signal
 
 from .conversation_store import ConversationStore
 from .config import SYSTEM_PROMPT
+from .coding_mode import build_coding_prompt
+from .project_context import build_project_context
 from .ollama_client import OllamaClient, OllamaError
 from .settings_store import SettingsStore
 from .speech_filter import DuplicateFilter
@@ -86,6 +88,15 @@ class MessageProcessor(QThread):
     def regenerate_last_answer(self) -> None:
         self._queue.put(("REGENERATE", None))
 
+    def edit_last_user_message(self, text: str) -> None:
+        text = text.strip()
+        if text:
+            self.cancel_current()
+            self._queue.put(("EDIT_LAST", text))
+
+    def toggle_pin_current_conversation(self) -> None:
+        self._queue.put(("PIN", None))
+
     def cancel_current(self) -> None:
         with self._cancel_lock:
             if self._cancel_event is not None:
@@ -130,7 +141,24 @@ class MessageProcessor(QThread):
             self._conversation_id,
             int(self.settings.get("max_history_messages", 16)),
         )
-        return [{"role": "system", "content": str(self.settings.get("system_prompt", SYSTEM_PROMPT))}] + messages
+        latest_user = next(
+            (str(item["content"]) for item in reversed(messages) if item["role"] == "user"),
+            "",
+        )
+        system_parts = [
+            str(self.settings.get("system_prompt", SYSTEM_PROMPT)),
+            build_coding_prompt(
+                latest_user,
+                str(self.settings.get("assistant_mode", "coding")),
+            ),
+        ]
+        project_root = str(self.settings.get("project_root", "") or "").strip()
+        if project_root:
+            project_context = build_project_context(project_root)
+            if project_context:
+                system_parts.append(project_context)
+        system_content = "\n\n".join(part for part in system_parts if part)
+        return [{"role": "system", "content": system_content}] + messages
 
     def _run_message(self, text: str, bypass_filter: bool, persist_user: bool = True) -> None:
         if not bypass_filter:
@@ -245,6 +273,26 @@ class MessageProcessor(QThread):
                 self.settings.update({"active_conversation_id": self._conversation_id})
                 self._emit_current_conversation()
             self._emit_saved_conversations()
+            return
+        if command == "PIN":
+            items = self.store.list_conversations()
+            current = next(
+                (item for item in items if int(item["id"]) == self._conversation_id),
+                None,
+            )
+            if current is not None:
+                pinned = not bool(current.get("is_pinned", 0))
+                self.store.set_pinned(self._conversation_id, pinned)
+                self._emit_saved_conversations()
+                self.status_changed.emit("Диалог закреплён" if pinned else "Диалог откреплён")
+            return
+        if command == "EDIT_LAST":
+            text = str(payload).strip()
+            if not self.store.edit_last_user_message(self._conversation_id, text):
+                self.status_changed.emit("Нет вопроса для редактирования")
+                return
+            self._emit_current_conversation()
+            self._run_message(text, bypass_filter=True, persist_user=False)
             return
         if command == "REGENERATE":
             text = self.store.last_user_message(self._conversation_id)
