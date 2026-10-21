@@ -37,7 +37,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r11"
+BUILD_VERSION = "2026.10.21-r12"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -1723,6 +1723,7 @@ class AssistantWindow(QWidget):
         self.processor.regenerate_last_answer()
 
     def _scroll_to_bottom(self):
+        self._follow_stream_output = True
         scrollbar = self.scroll.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
