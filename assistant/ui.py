@@ -10,7 +10,7 @@ from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
+    Qt, QEvent, QObject, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
 )
 from PySide6.QtGui import (
     QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
@@ -36,7 +36,7 @@ from .settings_store import SettingsStore
 from .speech_output import SpeechOutput
 
 
-BUILD_VERSION = "2026.10.21-r10"
+BUILD_VERSION = "2026.10.21-r11"
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -312,7 +312,6 @@ class IconButton(QPushButton):
         "send",
         "pause",
         "play",
-        "copy",
         "retry",
         "edit",
         "plus",
@@ -429,16 +428,6 @@ class IconButton(QPushButton):
             path.lineTo(s * 0.36, s * 0.77)
             path.closeSubpath()
             painter.drawPath(path)
-
-        elif self.icon_name == "copy":
-            painter.drawRoundedRect(
-                int(s * 0.34), int(s * 0.17),
-                int(s * 0.46), int(s * 0.49), 2, 2,
-            )
-            painter.drawRoundedRect(
-                int(s * 0.19), int(s * 0.34),
-                int(s * 0.46), int(s * 0.49), 2, 2,
-            )
 
         elif self.icon_name == "retry":
             path.moveTo(s * 0.76, s * 0.36)
@@ -856,6 +845,28 @@ class TypingBubble(QFrame):
         self.timer.stop()
 
 
+class ChatWheelFilter(QObject):
+    """Route mouse-wheel input over chat messages to the chat scroll area."""
+
+    def __init__(self, scroll_area: QScrollArea):
+        super().__init__(scroll_area)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel:
+            delta = event.pixelDelta().y()
+            if not delta:
+                delta = event.angleDelta().y()
+
+            if delta:
+                scrollbar = self.scroll_area.verticalScrollBar()
+                scrollbar.setValue(scrollbar.value() - int(delta))
+                event.accept()
+                return True
+
+        return super().eventFilter(watched, event)
+
+
 class AssistantWindow(QWidget):
     hotkey_toggle_signal = Signal()
     hotkey_set_listening_signal = Signal(bool)
@@ -1083,6 +1094,7 @@ class AssistantWindow(QWidget):
         root.addWidget(self.transcript_preview)
 
         self.scroll = QScrollArea()
+        self._chat_wheel_filter = ChatWheelFilter(self.scroll)
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -1338,15 +1350,12 @@ class AssistantWindow(QWidget):
         vertical.addLayout(row)
 
         action_row = None
-        copy_button = None
         retry_button = None
         edit_button = None
         repeat_user_button = None
 
         if role == "assistant" and with_actions:
-            action_row, copy_button, retry_button = (
-                self._create_message_actions(bubble)
-            )
+            action_row, retry_button = self._create_message_actions(bubble)
             vertical.addWidget(action_row, 0, Qt.AlignLeft)
         elif role == "user" and with_actions:
             action_row, edit_button, repeat_user_button = (
@@ -1375,24 +1384,14 @@ class AssistantWindow(QWidget):
             "role": role,
             "message_id": message_id,
             "actions": action_row,
-            "copy": copy_button,
             "retry": retry_button,
             "edit": edit_button,
             "repeat_user": repeat_user_button,
         })
+        self._install_chat_wheel_filter(container)
 
         QTimer.singleShot(30, self._scroll_to_bottom)
         return bubble
-
-    @staticmethod
-    def _extract_code_blocks(markdown: str) -> list[str]:
-        fence = chr(96) * 3
-        pattern = re.escape(fence) + r"[^\n]*\n(.*?)" + re.escape(fence)
-        return [
-            block.strip()
-            for block in re.findall(pattern, markdown or "", flags=re.DOTALL)
-            if block.strip()
-        ]
 
     def _create_user_message_actions(
         self, bubble: ChatBubble, message_id: int | None = None
@@ -1460,48 +1459,23 @@ class AssistantWindow(QWidget):
                 self.processor.edit_user_message(message_id, text.strip())
 
     def _create_message_actions(self, bubble: ChatBubble):
+        """Keep only the retry action below assistant answers."""
         row = QWidget()
         row.setStyleSheet("background: transparent;")
+        row.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(1, 2, 0, 0)
         layout.setSpacing(3)
 
-        copy_button = IconButton(
-            "copy", size=28, icon_size=15, tooltip="Копировать весь ответ"
-        )
-        copy_button.clicked.connect(
-            lambda _checked=False, b=bubble: QApplication.clipboard().setText(b.text)
-        )
-
-        code_button = QPushButton("Код")
-        code_button.setFixedHeight(28)
-        code_button.setVisible(bool(self._extract_code_blocks(bubble.text)))
-        code_button.setToolTip("Копировать блоки кода без Markdown-ограждений")
-        code_button.clicked.connect(
-            lambda _checked=False, b=bubble: QApplication.clipboard().setText(
-                "\n\n".join(self._extract_code_blocks(b.text))
-            )
-        )
-
-        speech_button = QPushButton("Голос")
-        speech_button.setFixedHeight(28)
-        speech_button.setToolTip("Озвучить ответ или остановить озвучивание")
-        speech_button.clicked.connect(
-            lambda _checked=False, b=bubble: self._toggle_speech(b.text)
-        )
-
         retry_button = IconButton(
-            "retry", size=28, icon_size=16,
+            "retry", size=30, icon_size=16,
             tooltip="Повторить генерацию последнего ответа"
         )
         retry_button.clicked.connect(self._regenerate_last)
 
-        layout.addWidget(copy_button)
-        layout.addWidget(code_button)
-        layout.addWidget(speech_button)
         layout.addWidget(retry_button)
         layout.addStretch(1)
-        return row, copy_button, retry_button
+        return row, retry_button
 
     def _show_user_message(self, text: str, message_id: int):
         self._remove_typing()
@@ -1603,16 +1577,16 @@ class AssistantWindow(QWidget):
         ):
             return
 
-        action_row, copy_button, retry_button = (
+        action_row, retry_button = (
             self._create_message_actions(self._streaming_bubble)
         )
 
         self._streaming_container.layout().addWidget(action_row)
+        self._install_chat_wheel_filter(action_row)
 
         for entry in reversed(self._message_entries):
             if entry["bubble"] is self._streaming_bubble:
                 entry["actions"] = action_row
-                entry["copy"] = copy_button
                 entry["retry"] = retry_button
                 break
 
@@ -2150,6 +2124,12 @@ class AssistantWindow(QWidget):
 
     def toggle_listening(self):
         self.audio.set_listening(not self.audio.listening)
+
+    def _install_chat_wheel_filter(self, widget: QWidget):
+        """Ensure wheel input over any part of a message scrolls the chat."""
+        widget.installEventFilter(self._chat_wheel_filter)
+        for child in widget.findChildren(QWidget):
+            child.installEventFilter(self._chat_wheel_filter)
 
     def _resize_bubbles(self):
         width = self._available_bubble_width()
