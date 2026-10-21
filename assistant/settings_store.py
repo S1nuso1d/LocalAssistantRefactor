@@ -19,7 +19,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "answer_model": "qwen3-coder:30b",
     "assistant_mode": "coding",
     "project_root": "",
-    "project_context_enabled": True,
+    "project_context_enabled": False,
     "classifier_model": "qwen3-coder:30b",
     "ollama_url": "http://localhost:11434/api/chat",
     "whisper_model": "base",
