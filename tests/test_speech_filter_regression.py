@@ -3,7 +3,11 @@ import unittest
 from unittest.mock import patch
 
 from assistant.ollama_client import OllamaClient
-from assistant.speech_filter import classify_by_rules, is_substantive_utterance
+from assistant.speech_filter import (
+    DuplicateFilter,
+    classify_by_rules,
+    is_substantive_utterance,
+)
 
 
 FOLLOW_UP = (
@@ -63,6 +67,29 @@ class SpeechFilterRegressionTests(unittest.TestCase):
             classify_by_rules("Ага", require_assistant_name=False),
             "reject",
         )
+
+    def test_overlapping_transcript_does_not_drop_real_continuation(self):
+        duplicate_filter = DuplicateFilter()
+        first = (
+            "Задание у тебя есть список ростов человека в сантиметрах"
+        )
+        continuation = (
+            first
+            + " например теперь напиши цикл и посчитай средний рост"
+        )
+
+        self.assertFalse(duplicate_filter.is_duplicate(first))
+        self.assertFalse(duplicate_filter.is_duplicate(continuation))
+
+    def test_nearly_identical_overlap_is_still_suppressed(self):
+        duplicate_filter = DuplicateFilter()
+        first = (
+            "Объясни пожалуйста как работает цикл в Python и приведи пример"
+        )
+        overlapping = first + " пожалуйста"
+
+        self.assertFalse(duplicate_filter.is_duplicate(first))
+        self.assertTrue(duplicate_filter.is_duplicate(overlapping))
 
 
 if __name__ == "__main__":
