@@ -223,7 +223,7 @@ class DuplicateFilter:
                     # extra words on the next chunk. Suppress near-identical
                     # duplicates, but keep genuine continuations that add
                     # substantial new information.
-                    if shorter in longer and len(shorter) / len(longer) >= 0.88:
+                    if shorter in longer and len(shorter) / len(longer) >= 0.80:
                         return True
 
             self.items.append((normalized, now))
