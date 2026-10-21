@@ -22,7 +22,10 @@ from PySide6.QtWidgets import (
 )
 
 from .audio_worker import AudioWorker
-from .config import DEFAULT_BACKGROUND_ALPHA
+from .config import (
+    DEFAULT_BACKGROUND_ALPHA,
+    DEFAULT_BACKGROUND_SATURATION,
+)
 from .conversation_store import ConversationStore
 from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
@@ -1818,7 +1821,15 @@ class AssistantWindow(QWidget):
 
         saturation = max(
             0,
-            min(100, int(self.settings_store.get("background_saturation", 65))),
+            min(
+                100,
+                int(
+                    self.settings_store.get(
+                        "background_saturation",
+                        DEFAULT_BACKGROUND_SATURATION,
+                    )
+                ),
+            ),
         ) / 100.0
         neutral = (18, 18, 22)
         tinted = (17, 19, 29)
