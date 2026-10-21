@@ -13,7 +13,8 @@ from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
 )
 from PySide6.QtGui import (
-    QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath
+    QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath,
+    QSyntaxHighlighter, QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -573,6 +574,61 @@ class WaveformWidget(QWidget):
         painter.end()
 
 
+class CodeSyntaxHighlighter(QSyntaxHighlighter):
+    """Color common tokens inside Markdown code blocks without third-party packages."""
+
+    _DOUBLE_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+    _SINGLE_STRING = re.compile(r"'(?:\\.|[^'\\])*'")
+    _COMMENT = re.compile(r"(#.*|//.*)")
+    _NUMBER = re.compile(r"\b\d+(?:\.\d+)?\b")
+    _KEYWORD = re.compile(
+        r"\b(?:False|True|None|and|as|assert|async|await|break|class|continue|def|del|"
+        r"elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|"
+        r"not|or|pass|raise|return|try|while|with|yield|fun|val|var|object|package|"
+        r"public|private|protected|internal|override|data|when|interface|const|let|"
+        r"function|export|default|new|this|typeof|null|undefined|SELECT|FROM|WHERE|"
+        r"JOIN|INSERT|UPDATE|DELETE|CREATE|TABLE|ORDER|BY|GROUP|AND|OR|NOT|AS)\b",
+        re.IGNORECASE,
+    )
+    _FUNCTION = re.compile(r"\b[A-Za-z_][A-Za-z_0-9]*(?=\s*\()")
+
+    def __init__(self, document):
+        super().__init__(document)
+        colors = {
+            "string": "#A8D7A3",
+            "comment": "#82909F",
+            "number": "#D9B7FF",
+            "keyword": "#8DAAFF",
+            "function": "#F3C98B",
+        }
+        self._formats = {}
+        for name, color in colors.items():
+            style = QTextCharFormat()
+            style.setForeground(QColor(color))
+            self._formats[name] = style
+
+    def highlightBlock(self, text: str):
+        # Qt Markdown marks fenced-code lines as non-breakable blocks.
+        if not self.currentBlock().blockFormat().nonBreakableLines():
+            return
+        occupied = [False] * len(text)
+        rules = (
+            ("string", self._DOUBLE_STRING),
+            ("string", self._SINGLE_STRING),
+            ("comment", self._COMMENT),
+            ("number", self._NUMBER),
+            ("keyword", self._KEYWORD),
+            ("function", self._FUNCTION),
+        )
+        for kind, pattern in rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                if any(occupied[start:end]):
+                    continue
+                self.setFormat(start, end - start, self._formats[kind])
+                occupied[start:end] = [True] * (end - start)
+
+
 class ChatBubble(QFrame):
     """Responsive message bubble with Markdown rendering."""
 
@@ -687,6 +743,7 @@ class ChatBubble(QFrame):
             }}
         """)
 
+        self._code_highlighter = CodeSyntaxHighlighter(self.body.document())
         self.body.setMarkdown(self.text)
         layout.addWidget(self.role_label)
         layout.addWidget(self.body)
