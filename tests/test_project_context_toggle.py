@@ -21,7 +21,7 @@ class ProjectContextToggleTests(unittest.TestCase):
             self.assertEqual(build_project_context_if_enabled(project), "")
 
             enabled_context = build_project_context_if_enabled(project, True)
-            self.assertIn("FILE: example.py", enabled_context)
+            self.assertIn("### example.py", enabled_context)
             self.assertIn("project context marker", enabled_context)
 
     def test_empty_or_missing_root_returns_empty_context(self):
