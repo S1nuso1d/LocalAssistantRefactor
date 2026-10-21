@@ -1677,13 +1677,18 @@ class AssistantWindow(QWidget):
         self._speak_text(text)
 
     def _speak_text(self, text: str):
+        was_speaking = self.speech_output.is_speaking()
+        resume_after_existing = was_speaking and self._tts_resume_listening
+        if was_speaking:
+            self.speech_output.stop()
         if self._tts_watch_timer.isActive():
             self._tts_watch_timer.stop()
-        self._tts_resume_listening = (
+        may_resume = (
             str(self.settings_store.get("activation_mode", "continuous")) != "push_to_talk"
             and self.audio is not None
             and self.audio.listening
         )
+        self._tts_resume_listening = bool(resume_after_existing or may_resume)
         if self.audio is not None and self.audio.listening:
             self.audio.set_listening(False)
         if not self.speech_output.speak(text):
