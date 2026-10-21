@@ -13,6 +13,7 @@ class CodingModeTests(unittest.TestCase):
         self.assertEqual(detect_programming_intent("Почему возникает traceback и как исправить ошибку?"), "debug")
         self.assertEqual(detect_programming_intent("Дай задачку по циклам"), "exercise")
         self.assertEqual(detect_programming_intent("Объясни, что делает декоратор"), "explain")
+        self.assertEqual(detect_programming_intent("Продолжи код с предыдущего ответа"), "continue")
         self.assertIsNone(detect_programming_intent("Привет, как дела?"))
 
     def test_general_mode_only_adds_prompt_for_programming_requests(self):

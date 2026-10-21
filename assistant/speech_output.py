@@ -37,7 +37,8 @@ class SpeechOutput:
             + text_b64
             + "')); Add-Type -AssemblyName System.Speech; "
               "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-              "$s.Rate=0; $s.Speak($t); $s.Dispose()"
+              "$s.Rate=0; $ru=$s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'ru*' } | Select-Object -First 1; "
+              "if ($ru) { $s.SelectVoice($ru.VoiceInfo.Name) }; $s.Speak($t); $s.Dispose()"
         )
         encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
         try:

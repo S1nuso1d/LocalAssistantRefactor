@@ -20,6 +20,10 @@ _PATTERNS = {
         r"напиши|сгенерируй|реализуй|создай.{0,15}(функц|класс|код|скрипт)|пример кода|написать код",
         re.IGNORECASE,
     ),
+    "continue": re.compile(
+        r"продолжи|продолжай|дополни|с того места|на основе предыдущего|продолжить работу с кодом",
+        re.IGNORECASE,
+    ),
 }
 
 _INTENT_INSTRUCTIONS = {
@@ -39,6 +43,10 @@ _INTENT_INSTRUCTIONS = {
         "Пользователь просит код. Дай цельный, запускаемый пример с нужными импортами, разумными именами "
         "и обработкой ошибок. Затем кратко объясни способ запуска."
     ),
+    "continue": (
+        "Продолжи работу с фрагментом, который уже обсуждался в этой переписке. Сохрани выбранный язык, "
+        "имена, архитектуру и контекст. Не переписывай весь проект заново без необходимости; покажи именно продолжение."
+    ),
 }
 
 
@@ -47,7 +55,7 @@ def detect_programming_intent(text: str) -> str | None:
     text = (text or "").strip()
     if not text:
         return None
-    for intent in ("debug", "exercise", "explain", "write_code"):
+    for intent in ("debug", "exercise", "explain", "write_code", "continue"):
         if _PATTERNS[intent].search(text):
             return intent
     return None

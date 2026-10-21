@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QSlider, QVBoxLayout, QFileDialog,
+    QSlider, QVBoxLayout, QFileDialog, QTabWidget, QWidget,
 )
 
 from .ollama_client import OllamaClient
@@ -49,9 +49,23 @@ class SettingsDialog(QDialog):
         root.addWidget(title)
         root.addWidget(subtitle)
 
-        form = QFormLayout()
-        form.setSpacing(12)
-        root.addLayout(form)
+        tabs = QTabWidget()
+        root.addWidget(tabs)
+
+        model_page = QWidget()
+        voice_page = QWidget()
+        appearance_page = QWidget()
+        model_form = QFormLayout(model_page)
+        voice_form = QFormLayout(voice_page)
+        appearance_form = QFormLayout(appearance_page)
+        model_form.setSpacing(12)
+        voice_form.setSpacing(12)
+        appearance_form.setSpacing(12)
+        tabs.addTab(model_page, "Модель")
+        tabs.addTab(voice_page, "Голос")
+        tabs.addTab(appearance_page, "Оформление")
+
+        form = model_form
 
         models = OllamaClient.list_models(str(settings.get("ollama_url")))
         for fallback in ("qwen3-coder:30b", "qwen2.5:14b", "qwen3-vl:latest", "gemma:2b"):
@@ -93,6 +107,7 @@ class SettingsDialog(QDialog):
         project_row.addWidget(clear_project)
         form.addRow("Контекст проекта", project_row)
 
+        form = voice_form
         self.language = QComboBox()
         self.language.addItem("Русский", "ru")
         self.language.addItem("English", "en")
@@ -178,6 +193,7 @@ class SettingsDialog(QDialog):
         self.activation_mode.setCurrentIndex(max(0, activation_index))
         form.addRow("Режим активации", self.activation_mode)
 
+        form = appearance_form
         opacity_layout = QHBoxLayout()
         self.opacity = QSlider(Qt.Horizontal)
         self.opacity.setRange(175, 250)
@@ -204,15 +220,15 @@ class SettingsDialog(QDialog):
 
         self.filter_speech = QCheckBox("Фильтровать фоновую речь")
         self.filter_speech.setChecked(bool(settings.get("filter_background_speech", True)))
-        form.addRow("Голос", self.filter_speech)
+        voice_form.addRow("Фильтр фоновой речи", self.filter_speech)
 
         self.require_name = QCheckBox("Отвечать только после обращения к ассистенту")
         self.require_name.setChecked(bool(settings.get("require_assistant_name", False)))
-        form.addRow("Режим обращения", self.require_name)
+        voice_form.addRow("Режим обращения", self.require_name)
 
         self.speech_output = QCheckBox("Автоматически озвучивать ответы голосом Windows")
         self.speech_output.setChecked(bool(settings.get("speech_output_enabled", False)))
-        form.addRow("Озвучивание ответов", self.speech_output)
+        voice_form.addRow("Озвучивание ответов", self.speech_output)
 
         self.compact_mode = QCheckBox("Запускать в компактном режиме")
         self.compact_mode.setChecked(bool(settings.get("compact_mode", False)))
