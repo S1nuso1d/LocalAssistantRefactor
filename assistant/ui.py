@@ -1,6 +1,7 @@
 """Modern dark-glass chat UI for Live Assistant."""
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import ctypes
 import logging
 import math
@@ -901,6 +902,14 @@ class AssistantWindow(QWidget):
         self.settings_store = SettingsStore()
         self.conversation_store = ConversationStore()
         self.speech_output = SpeechOutput()
+        self._tts_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="LocalAssistant-TTS",
+        )
+        self._tts_future: Future | None = None
+        self._tts_operation: str | None = None
+        self._tts_operation_id = 0
+        self._tts_shutting_down = False
         self._tts_resume_listening = False
         self._tts_watch_timer = QTimer(self)
         self._tts_watch_timer.setInterval(250)
@@ -1252,9 +1261,8 @@ class AssistantWindow(QWidget):
     def _handle_escape_shortcut(self):
         if self.cancel_button.isVisible():
             self._cancel_generation()
-        elif self.speech_output.is_speaking():
-            self.speech_output.stop()
-            self._poll_tts_state(force=True)
+        elif self._is_tts_active():
+            self._stop_speech_async()
 
     def _show_and_focus_input(self):
         self.showNormal()
@@ -1829,43 +1837,110 @@ class AssistantWindow(QWidget):
         self.processor.cancel_current()
         self._update_status("Останавливаю генерацию…")
 
+    def _is_tts_active(self) -> bool:
+        return (
+            self._tts_operation in {"starting", "speaking", "stopping"}
+            or self.speech_output.is_speaking()
+        )
+
+    def _start_speech_if_current(self, text: str, operation_id: int) -> bool:
+        """Run blocking process setup on the dedicated TTS worker thread."""
+        if self._tts_shutting_down or operation_id != self._tts_operation_id:
+            return False
+        return self.speech_output.speak(text)
+
     def _toggle_speech(self, text: str):
-        if self.speech_output.is_speaking():
-            self.speech_output.stop()
-            self._poll_tts_state(force=True)
+        if self._is_tts_active():
+            self._stop_speech_async()
             return
         self._speak_text(text)
 
     def _speak_text(self, text: str):
-        was_speaking = self.speech_output.is_speaking()
-        resume_after_existing = was_speaking and self._tts_resume_listening
-        if was_speaking:
-            self.speech_output.stop()
-        if self._tts_watch_timer.isActive():
-            self._tts_watch_timer.stop()
+        if self._tts_shutting_down:
+            return
+
+        was_active = self._is_tts_active()
+        resume_after_existing = was_active and self._tts_resume_listening
         may_resume = (
-            str(self.settings_store.get("activation_mode", "continuous")) != "push_to_talk"
+            str(self.settings_store.get("activation_mode", "continuous"))
+            != "push_to_talk"
             and self.audio is not None
             and self.audio.listening
         )
-        self._tts_resume_listening = bool(resume_after_existing or may_resume)
+        self._tts_resume_listening = bool(
+            resume_after_existing or may_resume
+        )
+
         if self.audio is not None and self.audio.listening:
+            # Avoid capturing the assistant's own synthesized speech.
             self.audio.set_listening(False)
-        if not self.speech_output.speak(text):
-            self._update_status("Не удалось запустить локальное озвучивание")
-            self._poll_tts_state(force=True)
-            return
-        self._update_status("Озвучиваю ответ…")
+
+        self._tts_operation_id += 1
+        operation_id = self._tts_operation_id
+        self._tts_operation = "starting"
+        self._tts_future = self._tts_executor.submit(
+            self._start_speech_if_current, text, operation_id
+        )
+        self._update_status("Запускаю озвучивание…")
         self._tts_watch_timer.start()
 
-    def _poll_tts_state(self, force: bool = False):
-        if not force and self.speech_output.is_speaking():
+    def _stop_speech_async(self):
+        """Stop SAPI off the UI thread and resume listening after it has stopped."""
+        if self._tts_shutting_down:
             return
+        if not self._is_tts_active():
+            return
+
+        self._tts_operation_id += 1
+        self._tts_operation = "stopping"
+        self._tts_future = self._tts_executor.submit(self.speech_output.stop)
+        self._tts_watch_timer.start()
+
+    def _finish_tts_state(self):
         self._tts_watch_timer.stop()
+        self._tts_future = None
+        self._tts_operation = None
         should_resume = self._tts_resume_listening
         self._tts_resume_listening = False
-        if should_resume and self.audio is not None:
+        if (
+            should_resume
+            and not self._tts_shutting_down
+            and self.audio is not None
+        ):
             self.audio.set_listening(True)
+
+    def _poll_tts_state(self):
+        operation = self._tts_operation
+        future = self._tts_future
+
+        if operation in {"starting", "stopping"}:
+            if future is None or not future.done():
+                return
+
+            try:
+                result = future.result()
+            except Exception:
+                logger.exception("Ошибка фоновой операции озвучивания.")
+                result = False
+
+            self._tts_future = None
+            if operation == "stopping":
+                self._finish_tts_state()
+                return
+
+            if not result:
+                self._update_status("Не удалось запустить локальное озвучивание")
+                self._finish_tts_state()
+                return
+
+            self._tts_operation = "speaking"
+            self._update_status("Озвучиваю ответ…")
+            operation = "speaking"
+
+        if operation == "speaking":
+            if self.speech_output.is_speaking():
+                return
+            self._finish_tts_state()
 
     def _show_menu(self):
         menu = QMenu(self)
@@ -2312,9 +2387,20 @@ class AssistantWindow(QWidget):
         if self.processor is not None:
             self.processor.stop()
 
-        self.speech_output.stop()
         self._tts_watch_timer.stop()
         self._tts_resume_listening = False
+        self._tts_shutting_down = True
+        self._tts_operation_id += 1
+        self._tts_operation = None
+        self._tts_future = None
+        try:
+            # Queue stop behind any in-flight launch so it cannot leave a
+            # PowerShell/SAPI process running after the window closes.
+            self._tts_executor.submit(self.speech_output.stop)
+            self._tts_executor.shutdown(wait=False)
+        except RuntimeError:
+            # The executor may already have been shut down by a prior close event.
+            self.speech_output.stop()
 
         audio_running = (
             self.audio is not None and self.audio.isRunning()
