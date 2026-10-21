@@ -21,7 +21,7 @@ logger = logging.getLogger("live_assistant.processor")
 
 
 class MessageProcessor(QThread):
-    user_message = Signal(str)
+    user_message = Signal(str, int)
     assistant_message = Signal(str)
     assistant_chunk = Signal(str)
     answer_metadata = Signal(str, int)
@@ -89,10 +89,18 @@ class MessageProcessor(QThread):
         self._queue.put(("REGENERATE", None))
 
     def edit_last_user_message(self, text: str) -> None:
+        """Compatibility shortcut for editing the last user message."""
         text = text.strip()
         if text:
             self.cancel_current()
             self._queue.put(("EDIT_LAST", text))
+
+    def edit_user_message(self, message_id: int, text: str) -> None:
+        """Edit a specific user turn and regenerate the conversation from there."""
+        text = text.strip()
+        if text:
+            self.cancel_current()
+            self._queue.put(("EDIT_MESSAGE", (int(message_id), text)))
 
     def toggle_pin_current_conversation(self) -> None:
         self._queue.put(("PIN", None))
@@ -153,7 +161,10 @@ class MessageProcessor(QThread):
             ),
         ]
         project_root = str(self.settings.get("project_root", "") or "").strip()
-        if project_root:
+        use_project_context = bool(
+            self.settings.get("project_context_enabled", True)
+        )
+        if project_root and use_project_context:
             project_context = build_project_context(project_root)
             if project_context:
                 system_parts.append(project_context)
@@ -181,8 +192,8 @@ class MessageProcessor(QThread):
                     return
 
         if persist_user:
-            self.store.add_message(self._conversation_id, "user", text)
-            self.user_message.emit(text)
+            message_id = self.store.add_message(self._conversation_id, "user", text)
+            self.user_message.emit(text, message_id)
             self._emit_saved_conversations()
 
         cancel_event = threading.Event()
@@ -286,11 +297,24 @@ class MessageProcessor(QThread):
                 self._emit_saved_conversations()
                 self.status_changed.emit("Диалог закреплён" if pinned else "Диалог откреплён")
             return
+        if command == "EDIT_MESSAGE":
+            message_id, text = payload
+            text = str(text).strip()
+            if not self.store.edit_user_message(
+                self._conversation_id, int(message_id), text
+            ):
+                self.status_changed.emit("Сообщение больше недоступно для редактирования")
+                return
+            self._duplicates = DuplicateFilter()
+            self._emit_current_conversation()
+            self._run_message(text, bypass_filter=True, persist_user=False)
+            return
         if command == "EDIT_LAST":
             text = str(payload).strip()
             if not self.store.edit_last_user_message(self._conversation_id, text):
                 self.status_changed.emit("Нет вопроса для редактирования")
                 return
+            self._duplicates = DuplicateFilter()
             self._emit_current_conversation()
             self._run_message(text, bypass_filter=True, persist_user=False)
             return
