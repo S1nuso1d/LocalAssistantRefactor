@@ -356,7 +356,7 @@ class MessageProcessor(QThread):
             if not text:
                 self.status_changed.emit("Нет сообщения для повторной генерации")
                 return
-            self.store.remove_last_assistant_message(self._conversation_id)
+            self.store.remove_last_response_message(self._conversation_id)
             self._run_message(text, bypass_filter=True, persist_user=False)
             return
 
