@@ -60,9 +60,29 @@ class ConversationStore:
                     ON conversations(updated_at DESC);
             """)
             # Keep existing history when opening databases from older builds.
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(conversations)")
+            }
             if "is_pinned" not in columns:
-                conn.execute("ALTER TABLE conversations ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+                conn.execute(
+                    "ALTER TABLE conversations "
+                    "ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # Older databases may have messages tables from before model timing
+            # metadata was introduced. CREATE TABLE IF NOT EXISTS does not alter
+            # such tables, so migrate the missing columns explicitly.
+            message_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(messages)")
+            }
+            if "model" not in message_columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN model TEXT")
+            if "duration_ms" not in message_columns:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN duration_ms INTEGER"
+                )
 
     def create_conversation(self, title: str = "Новый диалог") -> int:
         now = time.time()
