@@ -314,6 +314,7 @@ class IconButton(QPushButton):
         "play",
         "copy",
         "retry",
+        "edit",
         "plus",
         "search",
         "settings",
@@ -449,6 +450,19 @@ class IconButton(QPushButton):
                 int(s * 0.61), int(s * 0.64),
                 35 * 16, 285 * 16,
             )
+
+        elif self.icon_name == "edit":
+            path.moveTo(s * 0.22, s * 0.75)
+            path.lineTo(s * 0.64, s * 0.33)
+            path.lineTo(s * 0.76, s * 0.45)
+            path.lineTo(s * 0.34, s * 0.87)
+            path.lineTo(s * 0.17, s * 0.90)
+            path.closeSubpath()
+            painter.drawPath(path)
+            path = QPainterPath()
+            path.moveTo(s * 0.56, s * 0.40)
+            path.lineTo(s * 0.68, s * 0.52)
+            painter.drawPath(path)
 
         elif self.icon_name == "plus":
             path.moveTo(s * 0.50, s * 0.22)
@@ -1327,6 +1341,7 @@ class AssistantWindow(QWidget):
         copy_button = None
         retry_button = None
         edit_button = None
+        repeat_user_button = None
 
         if role == "assistant" and with_actions:
             action_row, copy_button, retry_button = (
@@ -1334,8 +1349,8 @@ class AssistantWindow(QWidget):
             )
             vertical.addWidget(action_row, 0, Qt.AlignLeft)
         elif role == "user" and with_actions:
-            action_row, edit_button = self._create_user_message_actions(
-                bubble, message_id
+            action_row, edit_button, repeat_user_button = (
+                self._create_user_message_actions(bubble, message_id)
             )
             vertical.addWidget(action_row, 0, Qt.AlignRight)
 
@@ -1363,6 +1378,7 @@ class AssistantWindow(QWidget):
             "copy": copy_button,
             "retry": retry_button,
             "edit": edit_button,
+            "repeat_user": repeat_user_button,
         })
 
         QTimer.singleShot(30, self._scroll_to_bottom)
@@ -1381,18 +1397,55 @@ class AssistantWindow(QWidget):
     def _create_user_message_actions(
         self, bubble: ChatBubble, message_id: int | None = None
     ):
+        """Create a roomy icon-only action row under a user message."""
         row = QWidget()
         row.setStyleSheet("background: transparent;")
+        row.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        row.setMinimumHeight(38)
+
         layout = QHBoxLayout(row)
-        layout.setContentsMargins(1, 0, 1, 0)
-        edit_button = QPushButton("Изменить и повторить")
-        edit_button.setFixedHeight(27)
+        # Use fixed-size icon buttons and enough row height to avoid stylesheet
+        # padding clipping the old 27 px text button.
+        layout.setContentsMargins(3, 4, 3, 4)
+        layout.setSpacing(5)
+
+        edit_button = IconButton(
+            "edit",
+            size=30,
+            icon_size=16,
+            tooltip="Изменить вопрос и сгенерировать ответ заново",
+        )
         edit_button.clicked.connect(
             lambda _checked=False, b=bubble, mid=message_id:
                 self._edit_user_message(b, mid)
         )
+
+        repeat_button = IconButton(
+            "retry",
+            size=30,
+            icon_size=16,
+            tooltip=(
+                "Повторить этот запрос. Последующие сообщения в диалоге "
+                "будут удалены, чтобы не смешивать разные ветки разговора."
+            ),
+        )
+        repeat_button.clicked.connect(
+            lambda _checked=False, b=bubble, mid=message_id:
+                self._repeat_user_message(b, mid)
+        )
+
         layout.addWidget(edit_button)
-        return row, edit_button
+        layout.addWidget(repeat_button)
+        return row, edit_button, repeat_button
+
+    def _repeat_user_message(
+        self, bubble: ChatBubble, message_id: int | None = None
+    ):
+        """Regenerate this user turn and discard later dependent turns."""
+        if message_id is None:
+            self.processor.edit_last_user_message(bubble.text)
+        else:
+            self.processor.edit_user_message(message_id, bubble.text)
 
     def _edit_user_message(
         self, bubble: ChatBubble, message_id: int | None = None
