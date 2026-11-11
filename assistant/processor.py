@@ -5,15 +5,17 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
 from .conversation_store import ConversationStore
-from .config import SYSTEM_PROMPT
+from .config import MAX_PENDING_VOICE_PHRASES, SYSTEM_PROMPT
 from .ollama_client import OllamaClient, OllamaError
 from .settings_store import SettingsStore
 from .speech_filter import DuplicateFilter
+from .text_utils import strip_thinking
 
 logger = logging.getLogger("live_assistant.processor")
 
@@ -22,6 +24,7 @@ class MessageProcessor(QThread):
     user_message = Signal(str)
     assistant_message = Signal(str)
     assistant_chunk = Signal(str)
+    error_message = Signal(str)
     answer_metadata = Signal(str, int)
     typing_changed = Signal(bool)
     status_changed = Signal(str)
@@ -43,6 +46,10 @@ class MessageProcessor(QThread):
         self._client = OllamaClient(self.settings)
         self._cancel_lock = threading.Lock()
         self._cancel_event: threading.Event | None = None
+        # Voice phrases wait here (bounded) instead of in the main queue, so a
+        # long answer cannot build up a backlog of stale background questions.
+        self._voice_lock = threading.Lock()
+        self._voice_texts: deque[str] = deque(maxlen=MAX_PENDING_VOICE_PHRASES)
 
         saved_id = self.settings.get("active_conversation_id")
         try:
@@ -65,8 +72,14 @@ class MessageProcessor(QThread):
 
     def enqueue_text(self, text: str, bypass_filter: bool = False) -> None:
         text = text.strip()
-        if text:
-            self._queue.put(("MESSAGE", (text, bypass_filter)))
+        if not text:
+            return
+        if bypass_filter:
+            self._queue.put(("MESSAGE", (text, True)))
+            return
+        with self._voice_lock:
+            self._voice_texts.append(text)  # oldest is dropped when full
+        self._queue.put(("VOICE", None))
 
     def clear_conversation(self) -> None:
         self._queue.put(("CLEAR", None))
@@ -87,6 +100,8 @@ class MessageProcessor(QThread):
         self._queue.put(("REGENERATE", None))
 
     def cancel_current(self) -> None:
+        with self._voice_lock:
+            self._voice_texts.clear()
         with self._cancel_lock:
             if self._cancel_event is not None:
                 self._cancel_event.set()
@@ -130,9 +145,24 @@ class MessageProcessor(QThread):
             self._conversation_id,
             int(self.settings.get("max_history_messages", 16)),
         )
-        return [{"role": "system", "content": str(self.settings.get("system_prompt", SYSTEM_PROMPT))}] + messages
+        context: list[dict[str, str]] = []
+        for message in messages:
+            content = message["content"]
+            if message["role"] == "assistant":
+                # Reasoning traces waste context and confuse follow-ups.
+                content = strip_thinking(content)
+            if content.strip():
+                context.append({"role": message["role"], "content": content})
+        prompt = str(self.settings.get("system_prompt", SYSTEM_PROMPT))
+        return [{"role": "system", "content": prompt}] + context
 
-    def _run_message(self, text: str, bypass_filter: bool, persist_user: bool = True) -> None:
+    def _run_message(
+        self,
+        text: str,
+        bypass_filter: bool,
+        persist_user: bool = True,
+        restore_on_failure: dict[str, Any] | None = None,
+    ) -> None:
         if not bypass_filter:
             if self._duplicates.is_duplicate(text):
                 logger.info("Повтор голосовой фразы пропущен: %s", text)
@@ -145,8 +175,7 @@ class MessageProcessor(QThread):
                     logger.info("Решение фильтра (%s): %s", reason, text)
                 except OllamaError as exc:
                     logger.exception("Ошибка классификации неоднозначной фразы.")
-                    self.status_changed.emit("Ошибка классификатора")
-                    self.assistant_message.emit(f"Ошибка классификатора: {exc}")
+                    self.status_changed.emit(f"Ошибка классификатора: {exc}"[:160])
                     return
                 if not accepted:
                     self.status_changed.emit(f"Фраза пропущена фильтром: {reason}")
@@ -190,17 +219,19 @@ class MessageProcessor(QThread):
                 else:
                     self.status_changed.emit(f"Ответ готов · {model} · {elapsed_ms / 1000:.1f} с")
             elif cancel_event.is_set():
-                self.assistant_message.emit("Генерация остановлена.")
+                self._restore_answer(restore_on_failure)
                 self.status_changed.emit("Генерация остановлена")
             else:
                 raise OllamaError("Поток завершился без текста ответа.")
         except OllamaError as exc:
             logger.exception("Не удалось получить ответ от Ollama.")
-            self.assistant_message.emit(f"Ошибка ответа: {exc}")
+            self._restore_answer(restore_on_failure)
+            self.error_message.emit(f"Ошибка ответа: {exc}")
             self.status_changed.emit("Не удалось получить ответ")
         except Exception as exc:
             logger.exception("Неожиданная ошибка обработки сообщения.")
-            self.assistant_message.emit(f"Ошибка обработки: {exc}")
+            self._restore_answer(restore_on_failure)
+            self.error_message.emit(f"Ошибка обработки: {exc}")
             self.status_changed.emit("Ошибка обработки сообщения")
         finally:
             with self._cancel_lock:
@@ -208,6 +239,16 @@ class MessageProcessor(QThread):
                     self._cancel_event = None
             self.typing_changed.emit(False)
             self._emit_saved_conversations()
+
+    def _restore_answer(self, previous: dict[str, Any] | None) -> None:
+        """Put back the old answer if regeneration produced nothing."""
+        if not previous:
+            return
+        self.store.add_message(
+            self._conversation_id, "assistant", previous["content"],
+            model=previous.get("model"), duration_ms=previous.get("duration_ms"),
+        )
+        self.assistant_message.emit(previous["content"])
 
     def _handle_control(self, command: str, payload: Any) -> None:
         if command == "CLEAR":
@@ -251,12 +292,26 @@ class MessageProcessor(QThread):
             if not text:
                 self.status_changed.emit("Нет сообщения для повторной генерации")
                 return
-            self.store.remove_last_assistant_message(self._conversation_id)
-            self._run_message(text, bypass_filter=True, persist_user=False)
+            previous = self.store.pop_last_assistant_message(self._conversation_id)
+            self._run_message(
+                text, bypass_filter=True, persist_user=False,
+                restore_on_failure=previous,
+            )
             return
+
+    def _startup_check(self) -> None:
+        try:
+            ok, message = self._client.check_ready()
+        except Exception:
+            logger.exception("Проверка Ollama завершилась ошибкой.")
+            return
+        if not ok:
+            self.error_message.emit(message)
+            self.status_changed.emit("Ollama недоступна")
 
     def run(self) -> None:
         self._emit_current_conversation()
+        self._startup_check()
         while self._running:
             try:
                 item = self._queue.get(timeout=0.25)
@@ -268,5 +323,10 @@ class MessageProcessor(QThread):
             if command == "MESSAGE":
                 text, bypass_filter = payload
                 self._run_message(text, bypass_filter)
+            elif command == "VOICE":
+                with self._voice_lock:
+                    text = self._voice_texts.popleft() if self._voice_texts else None
+                if text:
+                    self._run_message(text, False)
             else:
                 self._handle_control(command, payload)

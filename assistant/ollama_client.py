@@ -52,10 +52,73 @@ class OllamaClient:
 
     @staticmethod
     def _extract_error(response: requests.Response) -> str:
+        """Prefer Ollama's JSON {"error": ...} over a raw body dump."""
         try:
+            try:
+                data = response.json()
+                if isinstance(data, dict) and data.get("error"):
+                    return str(data["error"])[:600].strip()
+            except ValueError:
+                pass
             return response.text[:600].strip()
         except Exception:
             return ""
+
+    def _http_error_message(
+        self, exc: requests.HTTPError, response: requests.Response | None, model: str,
+    ) -> str:
+        detail = self._extract_error(response) if response is not None else ""
+        status = getattr(response, "status_code", None)
+        if status == 404 or "not found" in detail.lower():
+            return (
+                f"Модель «{model}» не найдена в Ollama. "
+                f"Скачай её командой: ollama pull {model}"
+            )
+        return f"HTTP-ошибка Ollama: {exc}. {detail}".strip()
+
+    def _options(self, temperature: float | None = None) -> dict:
+        value = self.settings.get("temperature", 0.3) if temperature is None else temperature
+        return {
+            "temperature": float(value),
+            "num_ctx": int(self.settings.get("num_ctx", 8192)),
+        }
+
+    @staticmethod
+    def tags_url(chat_url: str | None = None) -> str:
+        base = (chat_url or OLLAMA_URL).rstrip("/")
+        return base.rsplit("/api/chat", 1)[0].rstrip("/") + "/api/tags"
+
+    @staticmethod
+    def _normalize_model(name: str) -> str:
+        name = name.strip()
+        return name if ":" in name else name + ":latest"
+
+    def check_ready(self) -> tuple[bool, str]:
+        """Cheap start-up probe: is Ollama up and are the models installed?"""
+        try:
+            response = self.session.get(self.tags_url(self._url()), timeout=3)
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError):
+            return False, (
+                "Ollama не отвечает. Запусти приложение Ollama — "
+                "голосовые и текстовые ответы заработают после этого."
+            )
+        installed = {
+            self._normalize_model(str(item.get("name", "")))
+            for item in data.get("models", []) if item.get("name")
+        }
+        wanted = {
+            str(self.settings.get("answer_model", MODEL_NAME)),
+            str(self.settings.get("classifier_model", MODEL_NAME)),
+        }
+        missing = sorted(m for m in wanted if self._normalize_model(m) not in installed)
+        if missing:
+            return False, (
+                "В Ollama не найдены модели: " + ", ".join(missing)
+                + ". Установи их (ollama pull …) или выбери другие в настройках."
+            )
+        return True, "Ollama готова"
 
     def _post_json(
         self,
@@ -69,7 +132,8 @@ class OllamaClient:
             "messages": messages,
             "stream": False,
             "format": "json",
-            "options": {"temperature": temperature},
+            "keep_alive": str(self.settings.get("keep_alive", "10m")),
+            "options": self._options(temperature),
         }
         response: requests.Response | None = None
         try:
@@ -92,8 +156,7 @@ class OllamaClient:
                 "Не удаётся подключиться к Ollama. Проверь, что она запущена на localhost:11434."
             ) from exc
         except requests.HTTPError as exc:
-            detail = self._extract_error(response) if response else ""
-            raise OllamaError(f"HTTP-ошибка Ollama: {exc}. {detail}".strip()) from exc
+            raise OllamaError(self._http_error_message(exc, response, model)) from exc
         except requests.RequestException as exc:
             raise OllamaError(f"Ошибка запроса к Ollama: {exc}") from exc
         except (ValueError, TypeError, KeyError) as exc:
@@ -179,7 +242,8 @@ false — обычный разговор людей между собой, ре
             "model": model_name,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": 0.3},
+            "keep_alive": str(self.settings.get("keep_alive", "10m")),
+            "options": self._options(),
         }
         response: requests.Response | None = None
         received = False
@@ -223,8 +287,7 @@ false — обычный разговор людей между собой, ре
                 raise OllamaError("Не удаётся подключиться к Ollama.") from exc
         except requests.HTTPError as exc:
             if not cancel_event.is_set():
-                detail = self._extract_error(response) if response else ""
-                raise OllamaError(f"HTTP-ошибка Ollama: {exc}. {detail}".strip()) from exc
+                raise OllamaError(self._http_error_message(exc, response, model_name)) from exc
         except requests.RequestException as exc:
             if not cancel_event.is_set():
                 raise OllamaError(f"Ошибка потокового ответа Ollama: {exc}") from exc
@@ -236,9 +299,9 @@ false — обычный разговор людей между собой, ре
     @staticmethod
     def list_models(ollama_url: str | None = None) -> list[str]:
         """Query locally installed models, without failing the settings dialog if offline."""
-        url = (ollama_url or OLLAMA_URL).rsplit("/api/chat", 1)[0].rstrip("/") + "/api/tags"
+        url = OllamaClient.tags_url(ollama_url)
         try:
-            response = requests.get(url, timeout=3)
+            response = requests.get(url, timeout=2)
             response.raise_for_status()
             data = response.json()
             names = [item.get("name", "") for item in data.get("models", [])]

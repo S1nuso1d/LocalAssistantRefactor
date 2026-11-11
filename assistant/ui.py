@@ -5,30 +5,39 @@ import ctypes
 import logging
 import math
 import sys
+import time
+from pathlib import Path
 from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF, QPoint, QSize
 )
 from PySide6.QtGui import (
-    QFont, QFontMetrics, QPainter, QColor, QPen, QPainterPath
+    QFontMetrics, QKeySequence, QPainter, QColor, QPen, QPainterPath, QShortcut
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QScrollArea, QSizePolicy, QLineEdit, QGraphicsOpacityEffect,
-    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip
+    QFrame, QScrollArea, QSizePolicy, QGraphicsOpacityEffect,
+    QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
+    QPlainTextEdit, QFileDialog
 )
 
 from .audio_worker import AudioWorker
 from .config import DEFAULT_BACKGROUND_ALPHA
 from .conversation_store import ConversationStore
+from .history_dialog import HistoryDialog
 from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore
+from .text_utils import format_time, safe_filename, split_thinking
 
 
-BUILD_VERSION = "2026.10.21-r6"
+BUILD_VERSION = "2026.11.11-r7"
+WELCOME_TEXT = (
+    "Привет! Я слушаю системный звук. Можешь задать вопрос голосом "
+    "или написать его внизу."
+)
 logger = logging.getLogger("live_assistant.ui")
 
 
@@ -174,6 +183,28 @@ QLineEdit::placeholder {
     color: #777F98;
 }
 
+QPlainTextEdit#composer {
+    color: #F4F5FF;
+    background-color: rgba(9, 11, 18, 170);
+    border: 1px solid rgba(171, 183, 231, 45);
+    border-radius: 16px;
+    padding: 12px 15px;
+    selection-background-color: #667CE0;
+}
+
+QPlainTextEdit#composer:focus {
+    border-color: rgba(150, 165, 255, 145);
+    background-color: rgba(10, 12, 21, 220);
+}
+
+QToolTip {
+    background-color: #1B1F31;
+    color: #E8EAF5;
+    border: 1px solid rgba(180, 191, 235, 60);
+    border-radius: 6px;
+    padding: 5px 8px;
+}
+
 QScrollArea {
     background: transparent;
     border: none;
@@ -280,14 +311,16 @@ def enable_acrylic(hwnd: int) -> bool:
         return False
 
 
-def exclude_window_from_capture(hwnd: int) -> None:
-    """Best-effort attempt to exclude this window from supported capture APIs."""
+def exclude_window_from_capture(hwnd: int, enabled: bool = True) -> None:
+    """Best-effort toggle of exclusion from supported capture APIs."""
     if sys.platform != "win32":
         return
 
     try:
-        result = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
-        logger.info("Window capture exclusion result: %s", bool(result))
+        # 0x11 = WDA_EXCLUDEFROMCAPTURE, 0x0 = WDA_NONE
+        affinity = 0x00000011 if enabled else 0x00000000
+        result = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity)
+        logger.info("Window capture exclusion=%s result: %s", enabled, bool(result))
     except Exception:
         logger.exception("Could not set window capture exclusion.")
 
@@ -309,6 +342,7 @@ class IconButton(QPushButton):
         "plus",
         "search",
         "settings",
+        "history",
     }
 
     def __init__(
@@ -457,6 +491,15 @@ class IconButton(QPushButton):
             path.lineTo(s * 0.82, s * 0.82)
             painter.drawPath(path)
 
+        elif self.icon_name == "history":
+            painter.drawEllipse(
+                QPointF(s * 0.50, s * 0.50), s * 0.36, s * 0.36
+            )
+            path.moveTo(s * 0.50, s * 0.28)
+            path.lineTo(s * 0.50, s * 0.50)
+            path.lineTo(s * 0.66, s * 0.60)
+            painter.drawPath(path)
+
         elif self.icon_name == "settings":
             painter.drawEllipse(
                 QPointF(s * 0.50, s * 0.50), s * 0.15, s * 0.15
@@ -522,12 +565,17 @@ class WaveformWidget(QWidget):
         super().__init__(parent)
         self._levels = [0.06] * 24
         self._phase = 0
+        self._active = True
         self.setFixedSize(66, 24)
 
         self.timer = QTimer(self)
         self.timer.setInterval(75)
         self.timer.timeout.connect(self._tick)
         self.timer.start()
+
+    def set_active(self, active: bool):
+        self._active = bool(active)
+        self.update()
 
     def set_level(self, value: float):
         self._levels.append(max(0.02, min(1.0, float(value))))
@@ -551,14 +599,18 @@ class WaveformWidget(QWidget):
             idle = 0.08 + 0.06 * (
                 0.5 + 0.5 * math.sin(self._phase / 4 + i * 0.7)
             )
+            if not self._active:
+                level, idle = 0.0, 0.04
             bar_height = max(3.0, (level * 0.72 + idle) * height)
             x = i * (bar_width + spacing)
             y = (height - bar_height) / 2
 
             painter.setPen(Qt.NoPen)
-            painter.setBrush(
-                QColor(151, 166, 255, 190 if level > 0.18 else 105)
-            )
+            if self._active:
+                color = QColor(151, 166, 255, 190 if level > 0.18 else 105)
+            else:
+                color = QColor(240, 195, 110, 55)
+            painter.setBrush(color)
             painter.drawRoundedRect(
                 int(x), int(y), int(bar_width + 1),
                 int(bar_height), 2, 2,
@@ -567,14 +619,90 @@ class WaveformWidget(QWidget):
         painter.end()
 
 
+class ElidedLabel(QLabel):
+    """Single-line label that truncates with an ellipsis instead of
+    forcing the window (and header) wider."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self._full = text
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._apply()
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
+        self._full = text
+        self.setToolTip(text)
+        self._apply()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(30, super().minimumSizeHint().height())
+
+    def _apply(self) -> None:
+        width = max(10, self.width())
+        super().setText(
+            self.fontMetrics().elidedText(self._full, Qt.ElideRight, width)
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply()
+
+
+class ComposerEdit(QPlainTextEdit):
+    """Multi-line input: Enter sends, Shift+Enter inserts a newline.
+
+    Grows with its content up to MAX_HEIGHT, then scrolls.
+    """
+
+    submitted = Signal()
+    MIN_HEIGHT = 46
+    MAX_HEIGHT = 150
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("composer")
+        self.setTabChangesFocus(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setPlaceholderText(
+            "Напишите сообщение…  (Enter — отправить, Shift+Enter — новая строка)"
+        )
+        self.setFixedHeight(self.MIN_HEIGHT)
+        self.document().documentLayout().documentSizeChanged.connect(self._fit)
+
+    def _fit(self, *_args) -> None:
+        # For QPlainTextEdit the document height is measured in lines.
+        lines = max(1, int(self.document().documentLayout().documentSize().height()))
+        height = lines * self.fontMetrics().lineSpacing() + 36
+        self.setFixedHeight(max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, height)))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
+            event.modifiers() & Qt.ShiftModifier
+        ):
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class ChatBubble(QFrame):
     """Responsive message bubble with Markdown rendering."""
 
-    def __init__(self, text: str, role: str, max_width: int):
+    def __init__(
+        self,
+        text: str,
+        role: str,
+        max_width: int,
+        timestamp: float | None = None,
+    ):
         super().__init__()
         self.role = role
-        self.text = text
+        self.raw_text = text
+        self.text = text  # visible text without reasoning; used by "Copy"
+        self.timestamp = timestamp
         self.max_bubble_width = max(220, int(max_width))
+        self._margins = (14, 11, 14, 12)
         self.body: QTextBrowser
 
         self._build()
@@ -593,31 +721,60 @@ class ChatBubble(QFrame):
         self.fade_animation.setEasingCurve(QEasingCurve.OutCubic)
         self.fade_animation.start()
 
+    def _display_markdown(self, raw: str) -> str:
+        """Hide <think> blocks of reasoning models; keep a short note."""
+        if self.role != "assistant":
+            self.text = raw
+            return raw or " "
+
+        thinking, answer, still_thinking = split_thinking(raw)
+        self.text = answer
+        if still_thinking and not answer:
+            return "*💭 Думаю…*"
+        if thinking and answer:
+            words = len(thinking.split())
+            return f"*💭 Рассуждение скрыто · {words} сл.*\n\n{answer}"
+        return answer or " "
+
     def _build(self):
         is_user = self.role == "user"
         is_system = self.role == "system"
 
         if is_user:
-            frame_bg = "rgba(197, 214, 255, 242)"
-            border = "rgba(225, 234, 255, 185)"
-            text_color = "#19243D"
-            role_color = "#566789"
+            frame_bg = (
+                "qlineargradient(x1:0, y1:0, x2:1, y2:1, "
+                "stop:0 rgba(124, 140, 255, 245), "
+                "stop:1 rgba(92, 106, 232, 245))"
+            )
+            border = "rgba(205, 214, 255, 120)"
+            text_color = "#FFFFFF"
+            role_color = "#E3E8FF"
+            link_color = "#FFFFFF"
+            code_bg = "rgba(12, 16, 52, 150)"
             role_text = "Вы"
-            margins = (14, 11, 14, 12)
+            self._margins = (14, 10, 14, 12)
         elif is_system:
             frame_bg = "rgba(113, 43, 58, 180)"
             border = "rgba(255, 147, 164, 100)"
             text_color = "#FFF1F4"
             role_color = "#FFC0CC"
+            link_color = "#FFD6DD"
+            code_bg = "rgba(60, 10, 22, 160)"
             role_text = "Система"
-            margins = (13, 10, 13, 11)
+            self._margins = (13, 10, 13, 11)
         else:
-            frame_bg = "transparent"
-            border = "transparent"
+            frame_bg = "rgba(255, 255, 255, 10)"
+            border = "rgba(190, 200, 245, 34)"
             text_color = "#E9ECF8"
             role_color = "#9EADEB"
+            link_color = "#B7C5FF"
+            code_bg = "rgba(7, 9, 16, 210)"
             role_text = "Live Assistant"
-            margins = (3, 4, 3, 4)
+            self._margins = (14, 10, 14, 11)
+
+        clock = format_time(self.timestamp)
+        if clock:
+            role_text = f"{role_text}  ·  {clock}"
 
         self.setObjectName("chatBubble")
         self.setStyleSheet(f"""
@@ -636,7 +793,7 @@ class ChatBubble(QFrame):
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(*margins)
+        layout.setContentsMargins(*self._margins)
         layout.setSpacing(5)
 
         self.base_role_text = role_text
@@ -665,10 +822,10 @@ class ChatBubble(QFrame):
                 font-family: Consolas, 'Cascadia Code', monospace;
             }}
             pre {{
-                background-color: rgba(7, 9, 16, 210);
+                background-color: {code_bg};
                 padding: 8px;
             }}
-            a {{ color: #B7C5FF; }}
+            a {{ color: {link_color}; }}
             table {{ border-collapse: collapse; }}
             td, th {{
                 border: 1px solid #58617D;
@@ -681,13 +838,13 @@ class ChatBubble(QFrame):
             }}
         """)
 
-        self.body.setMarkdown(self.text)
+        self.body.setMarkdown(self._display_markdown(self.raw_text))
         layout.addWidget(self.role_label)
         layout.addWidget(self.body)
 
     def set_markdown(self, text: str):
-        self.text = text
-        self.body.setMarkdown(text or " ")
+        self.raw_text = text
+        self.body.setMarkdown(self._display_markdown(text))
         self._size_body()
 
     def set_metadata(self, model: str, duration_ms: int):
@@ -701,25 +858,20 @@ class ChatBubble(QFrame):
 
     def set_bubble_width(self, max_width: int):
         max_width = max(220, int(max_width))
+        left, right = self._margins[0], self._margins[2]
 
         if self.role == "user":
-            margins = 34
             metrics = QFontMetrics(self.body.font())
             lines = self.text.splitlines() or [self.text]
             longest_line = max(lines, key=len) if lines else ""
-            estimated = metrics.horizontalAdvance(longest_line) + margins + 28
+            estimated = (
+                metrics.horizontalAdvance(longest_line) + left + right + 28
+            )
             desired = min(max_width, max(180, estimated))
         else:
             desired = max_width
 
         self.setFixedWidth(desired)
-
-        if self.role == "user":
-            left, right = 14, 14
-        elif self.role == "system":
-            left, right = 13, 13
-        else:
-            left, right = 3, 3
 
         body_width = max(180, desired - left - right - 4)
         self.body.setFixedWidth(body_width)
@@ -805,6 +957,9 @@ class AssistantWindow(QWidget):
         self._close_pending = False
         self._hotkey_registered = False
         self._drag_position = None
+        self._generating = False
+        self._stick_to_bottom = True
+        self._geometry_restored = False
 
         self._bubbles: list[ChatBubble] = []
         self._rows: list[QWidget] = []
@@ -819,6 +974,7 @@ class AssistantWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(570, 730)
         self.setMinimumSize(430, 540)
+        self._restore_geometry()
 
         self._build_ui()
         self._apply_background_alpha()
@@ -829,13 +985,16 @@ class AssistantWindow(QWidget):
         )
 
         self._connect_signals()
+        self._install_shortcuts()
         self.audio.start()
         self.processor.start()
         self._register_hotkey()
 
         self._apply_compact_mode(
-            bool(self.settings_store.get("compact_mode", False))
+            bool(self.settings_store.get("compact_mode", False)),
+            initial=True,
         )
+        self.input.setFocus()
 
     def _set_window_flags(self):
         flags = Qt.Window | Qt.FramelessWindowHint
@@ -844,6 +1003,54 @@ class AssistantWindow(QWidget):
             flags |= Qt.WindowStaysOnTopHint
 
         self.setWindowFlags(flags)
+        # Changing flags may recreate the native window, which loses Acrylic.
+        self._acrylic_enabled = False
+
+    def _restore_geometry(self):
+        geometry = self.settings_store.get("window_geometry")
+        if not geometry or self.settings_store.get("compact_mode", False):
+            return
+        try:
+            x, y, w, h = (int(v) for v in geometry)
+        except (TypeError, ValueError):
+            return
+        # Ignore positions that would put the window off every screen.
+        if QApplication.screenAt(QPoint(x + 40, y + 40)) is None:
+            return
+        self.resize(max(430, w), max(540, h))
+        self.move(x, y)
+        self._geometry_restored = True
+
+    def _save_geometry(self):
+        if self.settings_store.get("compact_mode", False):
+            return
+        geo = self.frameGeometry()
+        try:
+            self.settings_store.update({
+                "window_geometry": [geo.x(), geo.y(), self.width(), self.height()]
+            })
+        except OSError:
+            logger.exception("Не удалось сохранить положение окна.")
+
+    def _install_shortcuts(self):
+        bindings = (
+            ("Ctrl+N", lambda: self.processor.new_conversation()),
+            ("Ctrl+K", self._open_history),
+            ("Ctrl+,", self._open_settings),
+            ("Ctrl+L", lambda: self.input.setFocus()),
+            ("Ctrl+E", self._export_conversation),
+            ("Esc", self._escape_pressed),
+        )
+        self._shortcuts = []
+        for sequence, handler in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._shortcuts.append(shortcut)
+
+    def _escape_pressed(self):
+        if self._generating:
+            self._cancel_generation()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -879,16 +1086,13 @@ class AssistantWindow(QWidget):
         self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet("color: #A8E8C9; font-size: 7pt;")
 
-        self.status_label = QLabel("Запуск…")
+        self.status_label = ElidedLabel("Запуск…")
         self.status_label.setObjectName("status")
-        self.status_label.setMaximumWidth(245)
 
         self.waveform = WaveformWidget()
 
         status_row.addWidget(self.status_dot)
-        status_row.addWidget(self.status_label)
-        status_row.addWidget(self.waveform)
-        status_row.addStretch(1)
+        status_row.addWidget(self.status_label, 1)
 
         title_stack.addWidget(title)
         title_stack.addLayout(status_row)
@@ -903,11 +1107,29 @@ class AssistantWindow(QWidget):
         self.cancel_button.setVisible(False)
         self.cancel_button.clicked.connect(self._cancel_generation)
 
+        self.new_button = IconButton(
+            "plus",
+            size=32,
+            icon_size=18,
+            tooltip="Новый диалог (Ctrl+N)",
+        )
+        self.new_button.clicked.connect(
+            lambda: self.processor.new_conversation()
+        )
+
+        self.history_button = IconButton(
+            "history",
+            size=32,
+            icon_size=18,
+            tooltip="История диалогов (Ctrl+K)",
+        )
+        self.history_button.clicked.connect(self._open_history)
+
         self.more_button = IconButton(
             "more",
             size=32,
             icon_size=18,
-            tooltip="История и настройки",
+            tooltip="Меню",
         )
         self.more_button.clicked.connect(self._show_menu)
 
@@ -929,7 +1151,8 @@ class AssistantWindow(QWidget):
 
         header_layout.addWidget(self.logo_button)
         header_layout.addLayout(title_stack, 1)
-        header_layout.addWidget(self.cancel_button)
+        header_layout.addWidget(self.new_button)
+        header_layout.addWidget(self.history_button)
         header_layout.addWidget(self.more_button)
         header_layout.addWidget(self.minimize_button)
         header_layout.addWidget(self.close_button)
@@ -967,10 +1190,8 @@ class AssistantWindow(QWidget):
         composer = QHBoxLayout()
         composer.setSpacing(8)
 
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Напишите сообщение…")
-        self.input.setMinimumHeight(46)
-        self.input.returnPressed.connect(self._send_typed_message)
+        self.input = ComposerEdit()
+        self.input.submitted.connect(self._send_typed_message)
 
         self.send_button = IconButton(
             "send",
@@ -981,8 +1202,13 @@ class AssistantWindow(QWidget):
         )
         self.send_button.clicked.connect(self._send_typed_message)
 
-        composer.addWidget(self.input, 1)
-        composer.addWidget(self.send_button)
+        self.cancel_button.setFixedSize(46, 46)
+        self.cancel_button.setIconSize(QSize(20, 20))
+        self.cancel_button.icon_size = 20
+
+        composer.addWidget(self.input, 1, Qt.AlignBottom)
+        composer.addWidget(self.cancel_button, 0, Qt.AlignBottom)
+        composer.addWidget(self.send_button, 0, Qt.AlignBottom)
         root.addLayout(composer)
 
         footer = QHBoxLayout()
@@ -998,11 +1224,13 @@ class AssistantWindow(QWidget):
         self.listen_button.setProperty("active", "true")
         self.listen_button.clicked.connect(self.toggle_listening)
 
-        help_label = QLabel("Ctrl + Shift + Space")
-        help_label.setObjectName("tiny")
+        self.hotkey_label = QLabel(self._hotkey_hint())
+        self.hotkey_label.setObjectName("tiny")
+        self.hotkey_label.setToolTip("Горячая клавиша паузы прослушивания")
 
         footer.addWidget(self.listen_button)
-        footer.addWidget(help_label)
+        footer.addWidget(self.waveform)
+        footer.addWidget(self.hotkey_label)
         footer.addStretch(1)
 
         self.resize_grip = QSizeGrip(self)
@@ -1015,18 +1243,26 @@ class AssistantWindow(QWidget):
 
         self.setStyleSheet(STYLE)
 
-        self._add_bubble(
-            "Привет! Я слушаю системный звук. Можешь задать вопрос голосом "
-            "или написать его внизу.",
-            "assistant",
+        self.scroll.verticalScrollBar().valueChanged.connect(
+            self._on_scroll_changed
         )
 
-    def _connect_signals(self):
-        self.audio.phrase_detected.connect(self._on_phrase_detected)
-        self.audio.status_changed.connect(self._update_status)
-        self.audio.listening_changed.connect(self._update_listening)
-        self.audio.audio_level.connect(self.waveform.set_level)
+        self._add_bubble(WELCOME_TEXT, "assistant")
 
+    def _hotkey_hint(self) -> str:
+        hotkey = str(self.settings_store.get("hotkey", "ctrl+shift+space"))
+        return " + ".join(part.strip().capitalize() for part in hotkey.split("+"))
+
+    def _connect_audio_signals(self, worker: AudioWorker):
+        worker.phrase_detected.connect(self._on_phrase_detected)
+        worker.status_changed.connect(self._update_status)
+        worker.listening_changed.connect(self._update_listening)
+        worker.audio_level.connect(self.waveform.set_level)
+
+    def _connect_signals(self):
+        self._connect_audio_signals(self.audio)
+
+        self.processor.error_message.connect(self._show_error_message)
         self.processor.user_message.connect(self._show_user_message)
         self.processor.assistant_message.connect(self._show_assistant_message)
         self.processor.assistant_chunk.connect(self._append_stream_chunk)
@@ -1081,8 +1317,13 @@ class AssistantWindow(QWidget):
         role: str,
         with_actions: bool = True,
         metadata: dict | None = None,
+        timestamp: float | None = None,
     ) -> ChatBubble:
-        bubble = ChatBubble(text, role, self._available_bubble_width())
+        if metadata and metadata.get("created_at"):
+            timestamp = float(metadata["created_at"])
+        bubble = ChatBubble(
+            text, role, self._available_bubble_width(), timestamp
+        )
 
         container = QWidget()
         container.setSizePolicy(
@@ -1141,7 +1382,8 @@ class AssistantWindow(QWidget):
             "retry": retry_button,
         })
 
-        QTimer.singleShot(30, self._scroll_to_bottom)
+        force = role == "user"
+        QTimer.singleShot(30, lambda: self._scroll_to_bottom(force=force))
         return bubble
 
     def _create_message_actions(self, bubble: ChatBubble):
@@ -1184,19 +1426,24 @@ class AssistantWindow(QWidget):
             if entry.get("retry") is not None:
                 entry["retry"].setVisible(False)
 
-        self._add_bubble(text, "user", with_actions=False)
+        self._add_bubble(
+            text, "user", with_actions=False, timestamp=time.time()
+        )
+
+    def _show_error_message(self, text: str):
+        self._remove_typing()
+
+        if self._streaming_bubble is not None:
+            self._remove_streaming_row()
+
+        self._add_bubble(text, "system", with_actions=False,
+                         timestamp=time.time())
+        self._scroll_to_bottom()
 
     def _show_assistant_message(self, text: str):
         self._remove_typing()
 
-        is_error = text.startswith((
-            "Ошибка ответа:",
-            "Не удалось",
-            "Ошибка классификатора:",
-            "Ошибка обработки:",
-        ))
-
-        if self._streaming_bubble is not None and not is_error:
+        if self._streaming_bubble is not None:
             if self._stream_timer.isActive():
                 self._stream_timer.stop()
 
@@ -1211,12 +1458,7 @@ class AssistantWindow(QWidget):
             self._pending_stream_text = ""
 
         else:
-            if self._streaming_bubble is not None and is_error:
-                self._remove_streaming_row()
-
-            self._add_bubble(
-                text, "system" if is_error else "assistant"
-            )
+            self._add_bubble(text, "assistant", timestamp=time.time())
 
         self._scroll_to_bottom()
 
@@ -1234,7 +1476,7 @@ class AssistantWindow(QWidget):
 
         if self._streaming_bubble is None:
             self._streaming_bubble = self._add_bubble(
-                "", "assistant", with_actions=False
+                "", "assistant", with_actions=False, timestamp=time.time()
             )
 
             if self._message_entries:
@@ -1313,6 +1555,7 @@ class AssistantWindow(QWidget):
         self._pending_stream_text = ""
 
     def _set_typing(self, enabled: bool):
+        self._generating = enabled
         self.cancel_button.setVisible(enabled)
 
         if enabled:
@@ -1369,7 +1612,15 @@ class AssistantWindow(QWidget):
         self._remove_latest_assistant_display()
         self.processor.regenerate_last_answer()
 
-    def _scroll_to_bottom(self):
+    def _on_scroll_changed(self, value: int):
+        scrollbar = self.scroll.verticalScrollBar()
+        self._stick_to_bottom = value >= scrollbar.maximum() - 48
+
+    def _scroll_to_bottom(self, force: bool = False):
+        """Follow new content only while the user is already at the bottom,
+        so reading earlier messages is not interrupted by streaming."""
+        if not (force or self._stick_to_bottom):
+            return
         scrollbar = self.scroll.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -1392,6 +1643,7 @@ class AssistantWindow(QWidget):
             self._add_bubble(
                 "История очищена. Продолжаем!", "assistant"
             )
+        self._stick_to_bottom = True
 
     def _load_conversation(
         self, conversation_id: int, title: str, messages: list[dict]
@@ -1423,15 +1675,13 @@ class AssistantWindow(QWidget):
                     with_actions=(
                         role == "assistant" and i == last_assistant_index
                     ),
-                    metadata=message if role == "assistant" else None,
+                    metadata=message,
                 )
 
         else:
-            self._add_bubble(
-                "Привет! Я слушаю системный звук. Можешь задать вопрос "
-                "голосом или написать его внизу.",
-                "assistant",
-            )
+            self._add_bubble(WELCOME_TEXT, "assistant")
+
+        QTimer.singleShot(60, lambda: self._scroll_to_bottom(force=True))
 
         self._on_conversations_changed(
             self.processor.list_conversations()
@@ -1455,12 +1705,13 @@ class AssistantWindow(QWidget):
     # ---------------------------------------------------------------
 
     def _send_typed_message(self):
-        text = self.input.text().strip()
+        text = self.input.toPlainText().strip()
 
         if not text:
             return
 
         self.input.clear()
+        self._stick_to_bottom = True
         self.processor.enqueue_text(text, True)
 
     def _on_phrase_detected(self, text: str):
@@ -1480,32 +1731,19 @@ class AssistantWindow(QWidget):
     def _show_menu(self):
         menu = QMenu(self)
 
-        new_action = menu.addAction("Новый диалог")
-        history_menu = menu.addMenu("История диалогов")
+        new_action = menu.addAction("Новый диалог\tCtrl+N")
+        history_action = menu.addAction("История и поиск…\tCtrl+K")
 
-        histories = self.processor.list_conversations()
+        menu.addSeparator()
 
-        if not histories:
-            empty = history_menu.addAction("История пуста")
-            empty.setEnabled(False)
-        else:
-            for conversation in histories[:30]:
-                label = str(conversation["title"])[:55]
-
-                if int(conversation["id"]) == self._current_conversation_id:
-                    label = "✓  " + label
-
-                action = history_menu.addAction(label)
-                action.setData(int(conversation["id"]))
-
-        search_action = menu.addAction("Поиск по истории")
         rename_action = menu.addAction("Переименовать диалог")
+        export_action = menu.addAction("Экспортировать в Markdown…\tCtrl+E")
         clear_action = menu.addAction("Очистить текущий диалог")
         delete_action = menu.addAction("Удалить текущий диалог")
 
         menu.addSeparator()
 
-        settings_action = menu.addAction("Настройки")
+        settings_action = menu.addAction("Настройки…\tCtrl+,")
         compact_action = menu.addAction(
             "Обычный размер"
             if self.settings_store.get("compact_mode", False)
@@ -1531,11 +1769,14 @@ class AssistantWindow(QWidget):
             )
         )
 
+        if chosen is None:
+            return
+
         if chosen == new_action:
             self.processor.new_conversation()
 
-        elif chosen == search_action:
-            self._search_history()
+        elif chosen == history_action:
+            self._open_history()
 
         elif chosen == rename_action:
             title, ok = QInputDialog.getText(
@@ -1547,6 +1788,9 @@ class AssistantWindow(QWidget):
 
             if ok and title.strip():
                 self.processor.rename_current_conversation(title.strip())
+
+        elif chosen == export_action:
+            self._export_conversation()
 
         elif chosen == clear_action:
             answer = QMessageBox.question(
@@ -1591,46 +1835,48 @@ class AssistantWindow(QWidget):
         elif chosen == pause_action:
             self.toggle_listening()
 
-        elif chosen is not None and chosen.data() is not None:
-            try:
-                self.processor.switch_conversation(
-                    int(chosen.data())
-                )
-            except (TypeError, ValueError):
-                pass
-
-    def _search_history(self):
-        query, ok = QInputDialog.getText(
+    def _open_history(self):
+        dialog = HistoryDialog(
             self,
-            "Поиск по истории",
-            "Найти в названиях и сообщениях:",
+            lambda query: self.processor.list_conversations(query),
+            self._current_conversation_id,
         )
 
-        if not ok or not query.strip():
+        if dialog.exec() != HistoryDialog.Accepted:
             return
 
-        results = self.processor.list_conversations(query.strip())
+        chosen = dialog.selected_id
 
-        if not results:
-            QMessageBox.information(
-                self, "Поиск", "Совпадений не найдено."
+        if chosen is not None and chosen != self._current_conversation_id:
+            self.processor.switch_conversation(chosen)
+
+    def _export_conversation(self):
+        if self._current_conversation_id is None:
+            return
+
+        suggested = safe_filename(self._current_conversation_title) + ".md"
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт диалога",
+            suggested,
+            "Markdown (*.md);;Текст (*.txt)",
+        )
+
+        if not path:
+            return
+
+        try:
+            content = self.conversation_store.export_markdown(
+                self._current_conversation_id
+            )
+            Path(path).write_text(content, encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(
+                self, "Экспорт", f"Не удалось сохранить файл:\n{exc}"
             )
             return
 
-        menu = QMenu(self)
-
-        for item in results[:50]:
-            action = menu.addAction(str(item["title"])[:70])
-            action.setData(int(item["id"]))
-
-        chosen = menu.exec(
-            self.more_button.mapToGlobal(
-                self.more_button.rect().bottomLeft()
-            )
-        )
-
-        if chosen and chosen.data() is not None:
-            self.processor.switch_conversation(int(chosen.data()))
+        self._update_status(f"Диалог сохранён: {Path(path).name}")
 
     def _open_settings(self):
         before = self.settings_store.all()
@@ -1647,13 +1893,15 @@ class AssistantWindow(QWidget):
         )
         self._set_window_flags()
         self.show()
+        self._apply_capture_exclusion()
+        self.hotkey_label.setText(self._hotkey_hint())
 
         self._unregister_hotkey()
         self._register_hotkey()
 
         audio_restart_needed = any(
             before.get(key) != after.get(key)
-            for key in ("audio_device", "whisper_model")
+            for key in ("audio_device", "whisper_model", "whisper_device")
         )
 
         if audio_restart_needed:
@@ -1669,13 +1917,14 @@ class AssistantWindow(QWidget):
             )
             return
 
+        was_listening = old_worker.listening
         old_worker.deleteLater()
 
         self.audio = AudioWorker(self.settings_store)
-        self.audio.phrase_detected.connect(self._on_phrase_detected)
-        self.audio.status_changed.connect(self._update_status)
-        self.audio.listening_changed.connect(self._update_listening)
-        self.audio.audio_level.connect(self.waveform.set_level)
+        self._connect_audio_signals(self.audio)
+        # Keep the pause state across a restart so UI and worker agree.
+        self.audio._listening = was_listening
+        self._update_listening(was_listening)
         self.audio.start()
 
     def _toggle_compact_mode(self):
@@ -1685,13 +1934,14 @@ class AssistantWindow(QWidget):
         self.settings_store.update({"compact_mode": value})
         self._apply_compact_mode(value)
 
-    def _apply_compact_mode(self, compact: bool):
+    def _apply_compact_mode(self, compact: bool, initial: bool = False):
         if compact:
             self.setMinimumSize(370, 480)
             self.resize(420, 570)
         else:
             self.setMinimumSize(430, 540)
-            self.resize(570, 730)
+            if not (initial and self._geometry_restored):
+                self.resize(570, 730)
 
         QTimer.singleShot(0, self._resize_bubbles)
 
@@ -1730,6 +1980,8 @@ class AssistantWindow(QWidget):
             if enabled
             else "Возобновить прослушивание"
         )
+
+        self.waveform.set_active(enabled)
 
         self.listen_button.style().unpolish(self.listen_button)
         self.listen_button.style().polish(self.listen_button)
@@ -1785,7 +2037,13 @@ class AssistantWindow(QWidget):
         if not self._acrylic_enabled:
             self._acrylic_enabled = enable_acrylic(hwnd)
 
-        exclude_window_from_capture(hwnd)
+        self._apply_capture_exclusion()
+
+    def _apply_capture_exclusion(self):
+        exclude_window_from_capture(
+            int(self.winId()),
+            bool(self.settings_store.get("hide_from_capture", True)),
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1816,6 +2074,9 @@ class AssistantWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
+        if not self._close_pending:
+            self._save_geometry()
+
         self._unregister_hotkey()
 
         if self.audio is not None:
@@ -1862,8 +2123,3 @@ class AssistantWindow(QWidget):
 
         if not audio_running and not processor_running:
             self.close()
-
-
-def create_window():
-    """Create a window after QApplication exists."""
-    return AssistantWindow()

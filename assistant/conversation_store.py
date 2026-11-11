@@ -8,6 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from .settings_store import app_data_dir
+from .text_utils import format_time
+
+
+def escape_like(text: str) -> str:
+    """Escape % and _ so a user's search text is matched literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class ConversationStore:
@@ -77,12 +83,12 @@ class ConversationStore:
         query = query.strip()
         with self._connection() as conn:
             if query:
-                like = f"%{query}%"
+                like = f"%{escape_like(query)}%"
                 rows = conn.execute("""
                     SELECT DISTINCT c.id, c.title, c.created_at, c.updated_at
                     FROM conversations c
                     LEFT JOIN messages m ON m.conversation_id=c.id
-                    WHERE c.title LIKE ? OR m.content LIKE ?
+                    WHERE c.title LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\'
                     ORDER BY c.updated_at DESC LIMIT ?
                 """, (like, like, limit)).fetchall()
             else:
@@ -145,6 +151,42 @@ class ConversationStore:
     def delete_conversation(self, conversation_id: int) -> None:
         with self._connection() as conn:
             conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+
+    def pop_last_assistant_message(self, conversation_id: int) -> dict[str, Any] | None:
+        """Remove and return the newest assistant message (for safe regenerate)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id, content, model, duration_ms FROM messages "
+                "WHERE conversation_id=? AND role='assistant' ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM messages WHERE id=?", (row["id"],))
+            return dict(row)
+
+    def conversation_title(self, conversation_id: int) -> str:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT title FROM conversations WHERE id=?", (conversation_id,)
+            ).fetchone()
+        return str(row["title"]) if row else "Диалог"
+
+    def export_markdown(self, conversation_id: int) -> str:
+        """Render a conversation as a portable Markdown document."""
+        title = self.conversation_title(conversation_id)
+        lines = [f"# {title}", ""]
+        for message in self.get_messages(conversation_id):
+            who = "Вы" if message["role"] == "user" else "Ассистент"
+            stamp = format_time(message.get("created_at"))
+            meta = [who] + ([stamp] if stamp else [])
+            if message.get("model"):
+                meta.append(str(message["model"]))
+            lines.append("**" + " · ".join(meta) + "**")
+            lines.append("")
+            lines.append(str(message["content"]).strip())
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
 
     def remove_last_assistant_message(self, conversation_id: int) -> None:
         with self._connection() as conn:

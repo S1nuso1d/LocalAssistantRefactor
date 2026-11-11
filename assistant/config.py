@@ -5,7 +5,7 @@ OLLAMA_URL = DEFAULT_SETTINGS["ollama_url"]
 MODEL_NAME = DEFAULT_SETTINGS["answer_model"]
 CLASSIFIER_MODEL_NAME = DEFAULT_SETTINGS["classifier_model"]
 WHISPER_MODEL = DEFAULT_SETTINGS["whisper_model"]
-WHISPER_DEVICE = "cpu"
+WHISPER_DEVICE = DEFAULT_SETTINGS["whisper_device"]
 WHISPER_COMPUTE_TYPE = "int8"
 LANGUAGE = DEFAULT_SETTINGS["language"]
 SAMPLE_RATE = 16000
@@ -15,20 +15,15 @@ SILENCE_THRESHOLD = DEFAULT_SETTINGS["silence_threshold"]
 SILENCE_DURATION = DEFAULT_SETTINGS["silence_duration"]
 MIN_SPEECH_DURATION = 0.45
 MAX_PHRASE_DURATION = 12.0
+PREROLL_CHUNKS = 1
 FILTER_BACKGROUND_SPEECH = DEFAULT_SETTINGS["filter_background_speech"]
 REQUIRE_ASSISTANT_NAME = DEFAULT_SETTINGS["require_assistant_name"]
-ASSISTANT_NAMES = (
-    "помощник", "ассистент", "чат gpt", "чатгпт", "эй помощник",
-)
+ASSISTANT_NAMES = tuple(DEFAULT_SETTINGS["assistant_names"])
 DUPLICATE_WINDOW_SECONDS = 20
 MAX_RECENT_PHRASES = 100
-CLASSIFIER_TIMEOUT = 90
-ANSWER_TIMEOUT = 180
+MAX_PENDING_VOICE_PHRASES = 2
+CLASSIFIER_TIMEOUT = DEFAULT_SETTINGS["classifier_timeout"]
+ANSWER_TIMEOUT = DEFAULT_SETTINGS["answer_timeout"]
 MAX_HISTORY_MESSAGES = DEFAULT_SETTINGS["max_history_messages"]
 DEFAULT_BACKGROUND_ALPHA = DEFAULT_SETTINGS["background_alpha"]
-SYSTEM_PROMPT = """
-Ты — локальный русскоязычный ассистент.
-Отвечай естественно, понятно и по существу, как в обычном чате.
-Используй контекст диалога, не повторяй вопрос без необходимости.
-Не утверждай, что выполнил действия на компьютере, если ты их не выполнял.
-""".strip()
+SYSTEM_PROMPT = DEFAULT_SETTINGS["system_prompt"]

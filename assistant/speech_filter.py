@@ -49,7 +49,29 @@ BACKGROUND_REGEXES = [
     re.compile(r"^(субтитры|продолжение следует)$"),
     re.compile(r"^(до свидания|всем пока|до встречи)$"),
     re.compile(r"^(раз два|раз два три)$"),
+    # Звуковые пометки, которые Whisper подставляет вместо речи.
+    re.compile(r"^(музыка|аплодисменты|смех|тишина|шум|звонок)( \1)*$"),
 ]
+
+# Типичные галлюцинации Whisper на музыке, шуме и тишине. Ищем фрагмент
+# внутри фразы (re.search), потому что модель часто дописывает их к реальной
+# речи или повторяет несколько раз подряд.
+HALLUCINATION_REGEXES = [
+    re.compile(r"субтитры (сделал|сделаны|подготовил|создавал|добавил)"),
+    re.compile(r"редактор субтитров"),
+    re.compile(r"корректор [а-яa-z]\.? ?[а-яa-z]+"),
+    re.compile(r"dimatorzok|amara\.org"),
+    re.compile(r"спасибо за (просмотр|внимание)"),
+    re.compile(r"подписывайтесь на (мой |наш )?(канал|страницу)"),
+    re.compile(r"ставьте (лайки?|палец вверх)"),
+    re.compile(r"продолжение следует"),
+    re.compile(r"thanks for watching|please subscribe"),
+]
+
+
+def is_whisper_hallucination(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(pattern.search(normalized) for pattern in HALLUCINATION_REGEXES)
 
 
 def normalize_text(text: str) -> str:
@@ -120,6 +142,9 @@ def is_obvious_background(text: str) -> bool:
     if not normalized or normalized in SHORT_REACTIONS:
         return True
 
+    if is_whisper_hallucination(normalized):
+        return True
+
     if len(normalized.split()) <= 2 and len(normalized) < 12:
         if (
             not has_assistant_name(normalized)
@@ -171,6 +196,9 @@ def classify_by_rules(
     normalized = normalize_text(text)
 
     if not normalized:
+        return "reject"
+
+    if is_whisper_hallucination(normalized):
         return "reject"
 
     if has_assistant_name(text, assistant_names):

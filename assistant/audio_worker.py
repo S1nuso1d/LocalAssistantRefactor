@@ -15,13 +15,14 @@ from .config import (
     LANGUAGE,
     MAX_PHRASE_DURATION,
     MIN_SPEECH_DURATION,
+    PREROLL_CHUNKS,
     SAMPLE_RATE,
     SILENCE_DURATION,
     SILENCE_THRESHOLD,
-    WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
     WHISPER_MODEL,
 )
+from .segmenter import PhraseSegmenter, segment_is_reliable
 from .settings_store import SettingsStore
 
 logger = logging.getLogger("live_assistant.audio")
@@ -103,41 +104,65 @@ class AudioWorker(QThread):
                 vad_filter=True,
                 condition_on_previous_text=False,
             )
-            return " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
+            parts = []
+            for segment in segments:
+                text = segment.text.strip()
+                if not text:
+                    continue
+                if not segment_is_reliable(
+                    getattr(segment, "no_speech_prob", None),
+                    getattr(segment, "avg_logprob", None),
+                    getattr(segment, "compression_ratio", None),
+                ):
+                    logger.info("Ненадёжный сегмент отброшен: %s", text)
+                    continue
+                parts.append(text)
+            return " ".join(parts).strip()
         except Exception:
             logger.exception("Ошибка распознавания аудио.")
             self.status_changed.emit("Ошибка распознавания речи")
             return ""
 
+    def _load_whisper(self) -> None:
+        model_name = str(self.settings.get("whisper_model", WHISPER_MODEL))
+        device = str(self.settings.get("whisper_device", WHISPER_DEVICE))
+        compute = {"cpu": "int8", "cuda": "float16"}.get(device, "auto")
+        try:
+            self._whisper = WhisperModel(
+                model_name, device=device, compute_type=compute
+            )
+        except Exception:
+            if device == "cpu":
+                raise
+            logger.exception("Whisper не запустился на %s; перехожу на CPU.", device)
+            self.status_changed.emit(f"Whisper: {device} недоступен, использую CPU")
+            self._whisper = WhisperModel(
+                model_name, device="cpu", compute_type="int8"
+            )
+
     def run(self) -> None:
         try:
             self.status_changed.emit("Загружаю модель распознавания…")
-            model_name = str(self.settings.get("whisper_model", WHISPER_MODEL))
-            self._whisper = WhisperModel(
-                model_name,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE_TYPE,
-            )
+            self._load_whisper()
             mic = self._loopback_microphone()
             self.status_changed.emit("Слушаю системный звук")
 
-            buffer: list[np.ndarray] = []
-            speech_seconds = 0.0
-            silence_seconds = 0.0
-            in_speech = False
+            segmenter = PhraseSegmenter(
+                CHUNK_DURATION, MIN_SPEECH_DURATION,
+                MAX_PHRASE_DURATION, PREROLL_CHUNKS,
+            )
 
             with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
                 while self._running:
                     try:
-                        if not self._listening:
-                            buffer.clear()
-                            speech_seconds = silence_seconds = 0.0
-                            in_speech = False
-                            self.audio_level.emit(0.0)
-                            time.sleep(0.05)
-                            continue
-
                         audio = recorder.record(numframes=CHUNK_FRAMES)
+                        if not self._listening:
+                            # Keep draining the device while paused; otherwise
+                            # the driver buffer fills with stale audio that
+                            # floods the pipeline on resume.
+                            segmenter.reset(clear_preroll=True)
+                            self.audio_level.emit(0.0)
+                            continue
                         if audio is None or len(audio) == 0:
                             continue
                         audio = np.asarray(audio, dtype=np.float32)
@@ -149,27 +174,13 @@ class AudioWorker(QThread):
                         threshold = float(self.settings.get("silence_threshold", SILENCE_THRESHOLD))
                         silence_limit = float(self.settings.get("silence_duration", SILENCE_DURATION))
 
-                        if rms >= threshold:
-                            buffer.append(audio.copy())
-                            speech_seconds += CHUNK_DURATION
-                            silence_seconds = 0.0
-                            in_speech = True
-                        elif in_speech:
-                            buffer.append(audio.copy())
-                            silence_seconds += CHUNK_DURATION
-
-                        finished = in_speech and silence_seconds >= silence_limit
-                        too_long = speech_seconds >= MAX_PHRASE_DURATION
-                        if finished or too_long:
-                            if buffer and speech_seconds >= MIN_SPEECH_DURATION:
-                                self.status_changed.emit("Распознаю речь…")
-                                transcript = self._transcribe(np.concatenate(buffer))
-                                if transcript:
-                                    logger.info("Распознано: %s", transcript)
-                                    self.phrase_detected.emit(transcript)
-                            buffer.clear()
-                            speech_seconds = silence_seconds = 0.0
-                            in_speech = False
+                        phrase = segmenter.feed(audio, rms, threshold, silence_limit)
+                        if phrase is not None:
+                            self.status_changed.emit("Распознаю речь…")
+                            transcript = self._transcribe(phrase)
+                            if transcript:
+                                logger.info("Распознано: %s", transcript)
+                                self.phrase_detected.emit(transcript)
                             self.audio_level.emit(0.0)
                             if self._running and self._listening:
                                 self.status_changed.emit("Слушаю системный звук")
