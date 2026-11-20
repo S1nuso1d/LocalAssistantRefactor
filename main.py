@@ -41,7 +41,8 @@ def main() -> int:
     # Construct Qt before importing the audio stack. On some Windows setups
     # this avoids the COM apartment warning triggered by early audio imports.
     app = QApplication(sys.argv)
-    app.setApplicationName("Live Assistant")
+    app.setApplicationName("LocalAssistant")
+    app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
 
     from assistant.ui import AssistantWindow
