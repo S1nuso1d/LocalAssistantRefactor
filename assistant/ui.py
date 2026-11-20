@@ -16,13 +16,13 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QDesktopServices, QFontMetrics, QKeySequence, QPainter, QColor, QPen,
-    QPainterPath, QShortcut
+    QPainterPath, QShortcut, QIcon, QPixmap
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QGraphicsOpacityEffect,
     QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
-    QPlainTextEdit, QFileDialog
+    QPlainTextEdit, QFileDialog, QSystemTrayIcon
 )
 
 from .audio_worker import AudioWorker
@@ -41,7 +41,7 @@ from .text_utils import (
 )
 
 
-BUILD_VERSION = "2026.11.19-r15"
+BUILD_VERSION = "2026.11.20-r16"
 TTS_MODE_LABELS = {
     "off": "выключена",
     "voice": "только ответы на голосовые вопросы",
@@ -1041,6 +1041,11 @@ class AssistantWindow(QWidget):
         self._stream_timer.timeout.connect(self._flush_stream_text)
 
         self._close_pending = False
+        self._exit_requested = False
+        self._tray_icon: QSystemTrayIcon | None = None
+        self._tray_icon_available = False
+        self._tray_menu: QMenu | None = None
+        self._tray_listening_action = None
         self._hotkey_registered = False
         self._drag_position = None
         self._generating = False
@@ -1075,6 +1080,7 @@ class AssistantWindow(QWidget):
         self.audio.start()
         self.processor.start()
         self._register_hotkey()
+        self._create_tray_icon()
 
         self._apply_compact_mode(
             bool(self.settings_store.get("compact_mode", False)),
@@ -1106,6 +1112,100 @@ class AssistantWindow(QWidget):
         self.resize(max(430, w), max(540, h))
         self.move(x, y)
         self._geometry_restored = True
+
+    def _create_tray_icon(self):
+        """Create the Windows notification-area icon and its control menu."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.warning(
+                "System tray is unavailable; closing the window will exit the app."
+            )
+            self._tray_icon_available = False
+            return
+
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#7D8BF0"))
+        painter.drawRoundedRect(3, 3, 58, 58, 17, 17)
+
+        star = QPainterPath()
+        star.moveTo(32, 10)
+        star.lineTo(37, 27)
+        star.lineTo(54, 32)
+        star.lineTo(37, 37)
+        star.lineTo(32, 54)
+        star.lineTo(27, 37)
+        star.lineTo(10, 32)
+        star.lineTo(27, 27)
+        star.closeSubpath()
+        painter.setBrush(QColor("#FFFFFF"))
+        painter.drawPath(star)
+        painter.end()
+
+        self._tray_icon = QSystemTrayIcon(QIcon(pixmap), self)
+        self._tray_icon.setToolTip("LocalAssistant — работает в фоне")
+
+        self._tray_menu = QMenu(self)
+        open_action = self._tray_menu.addAction("Открыть LocalAssistant")
+        open_action.triggered.connect(self._restore_from_tray)
+
+        self._tray_listening_action = self._tray_menu.addAction(
+            "Приостановить прослушивание"
+        )
+        self._tray_listening_action.triggered.connect(self.toggle_listening)
+
+        self._tray_menu.addSeparator()
+        exit_action = self._tray_menu.addAction("Завершить работу")
+        exit_action.triggered.connect(self._quit_application)
+
+        self._tray_menu.aboutToShow.connect(self._update_tray_menu)
+        self._tray_icon.setContextMenu(self._tray_menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.show()
+        self._tray_icon_available = True
+        logger.info("System tray icon initialized.")
+
+    def _update_tray_menu(self):
+        if self._tray_listening_action is None:
+            return
+
+        listening = (
+            self.audio is not None
+            and self.audio.listening
+        )
+        self._tray_listening_action.setText(
+            "Приостановить прослушивание"
+            if listening
+            else "Возобновить прослушивание"
+        )
+
+    def _on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        if self._exit_requested:
+            return
+
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_application(self):
+        """Stop background workers only after an explicit tray-menu exit."""
+        if self._exit_requested:
+            return
+
+        self._exit_requested = True
+        if self._tray_icon is not None:
+            self._tray_icon.hide()
+        self.close()
 
     def _save_geometry(self):
         if self.settings_store.get("compact_mode", False):
@@ -1231,7 +1331,7 @@ class AssistantWindow(QWidget):
             "close",
             size=32,
             icon_size=16,
-            tooltip="Закрыть приложение",
+            tooltip="Скрыть окно в системный трей",
         )
         self.close_button.clicked.connect(self.close)
 
@@ -2251,6 +2351,17 @@ class AssistantWindow(QWidget):
         super().mouseReleaseEvent(event)
 
     def closeEvent(self, event):
+        # A normal window close only hides the UI. Audio capture, the
+        # processor and the global hotkey keep running in the background.
+        if not self._exit_requested and self._tray_icon_available:
+            if not self._close_pending:
+                self._save_geometry()
+            self.hide()
+            event.ignore()
+            return
+
+        # Background workers are stopped only for an explicit application exit
+        # (or when Windows has no notification area available).
         self.speech.stop()
 
         if not self._close_pending:
@@ -2291,6 +2402,7 @@ class AssistantWindow(QWidget):
             return
 
         event.accept()
+        QTimer.singleShot(0, QApplication.quit)
 
     def _finish_close_if_ready(self):
         audio_running = (
