@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ollama_client import OllamaClient
-from .settings_store import DEFAULT_SETTINGS, SettingsStore
+from .settings_store import DEFAULT_SETTINGS, SettingsStore, normalize_ollama_url
 
 logger = logging.getLogger("live_assistant.settings")
 
@@ -97,6 +97,7 @@ class SettingsDialog(QDialog):
         root.addWidget(tabs, 1)
         self._build_models_tab(tabs)
         self._build_voice_tab(tabs)
+        self._build_speech_tab(tabs)
         self._build_window_tab(tabs)
         self._build_assistant_tab(tabs)
 
@@ -145,6 +146,14 @@ class SettingsDialog(QDialog):
         status_row.addWidget(self.refresh_button)
         form.addRow("", status_row)
 
+        self.warm_up = QCheckBox("Загружать модель ответов в память при запуске")
+        self.warm_up.setChecked(bool(s.get("warm_up_model", True)))
+        self.warm_up.setToolTip(
+            "Первый ответ приходит быстрее, но модель занимает память "
+            "видеокарты/ОЗУ, пока приложение открыто."
+        )
+        form.addRow("Прогрев", self.warm_up)
+
         self.num_ctx = QSpinBox()
         self.num_ctx.setRange(1024, 131072)
         self.num_ctx.setSingleStep(1024)
@@ -176,15 +185,29 @@ class SettingsDialog(QDialog):
         s = self.settings
 
         self.language = QComboBox()
-        self.language.addItem("Русский", "ru")
-        self.language.addItem("English", "en")
-        self.language.addItem("Автоопределение", "auto")
-        self.language.setCurrentIndex(max(0, self.language.findData(str(s.get("language", "ru")))))
+        for title, code in (
+            ("Русский", "ru"), ("English", "en"), ("Українська", "uk"),
+            ("Deutsch", "de"), ("Français", "fr"), ("Español", "es"),
+            ("Italiano", "it"), ("Polski", "pl"), ("Türkçe", "tr"),
+            ("中文", "zh"), ("日本語", "ja"), ("Автоопределение", "auto"),
+        ):
+            self.language.addItem(title, code)
+        saved_language = str(s.get("language", "ru"))
+        if self.language.findData(saved_language) < 0:
+            self.language.addItem(saved_language, saved_language)
+        self.language.setCurrentIndex(self.language.findData(saved_language))
         form.addRow("Язык распознавания", self.language)
 
         self.whisper_model = QComboBox()
-        self.whisper_model.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.whisper_model.setEditable(True)
+        self.whisper_model.addItems([
+            "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo",
+        ])
         self.whisper_model.setCurrentText(str(s.get("whisper_model", "base")))
+        self.whisper_model.setToolTip(
+            "Можно ввести любое имя модели faster-whisper или путь к папке. "
+            "large-v3-turbo доступна в новых версиях faster-whisper."
+        )
         form.addRow("Модель Whisper", self.whisper_model)
 
         self.whisper_device = QComboBox()
@@ -227,6 +250,14 @@ class SettingsDialog(QDialog):
         self.hotkey.setPlaceholderText("ctrl+shift+space")
         form.addRow("Горячая клавиша", self.hotkey)
 
+        self.filter_mode = QComboBox()
+        self.filter_mode.addItem("Сбалансированный (точнее, чуть медленнее)", "balanced")
+        self.filter_mode.addItem("Быстрый (отвечает на всё, похожее на вопрос)", "fast")
+        self.filter_mode.setCurrentIndex(
+            max(0, self.filter_mode.findData(str(s.get("filter_mode", "balanced"))))
+        )
+        form.addRow("Режим фильтра", self.filter_mode)
+
         self.filter_speech = QCheckBox("Фильтровать фоновую речь")
         self.filter_speech.setChecked(bool(s.get("filter_background_speech", True)))
         form.addRow("Фильтр", self.filter_speech)
@@ -235,11 +266,59 @@ class SettingsDialog(QDialog):
         self.require_name.setChecked(bool(s.get("require_assistant_name", False)))
         form.addRow("Режим обращения", self.require_name)
 
+        self.log_transcripts = QCheckBox("Писать распознанный текст в лог (для отладки)")
+        self.log_transcripts.setChecked(bool(s.get("log_transcripts", False)))
+        self.log_transcripts.setToolTip(
+            "По умолчанию в лог попадает только длина фразы: системный звук "
+            "может содержать закрытые разговоры."
+        )
+        form.addRow("Приватность лога", self.log_transcripts)
+
         self.assistant_names = QLineEdit(", ".join(s.get("assistant_names") or []))
         self.assistant_names.setPlaceholderText("помощник, ассистент")
         self.assistant_names.setToolTip("Имена через запятую, на которые откликается ассистент.")
         form.addRow("Имена ассистента", self.assistant_names)
         tabs.addTab(page, "Голос")
+
+    def _build_speech_tab(self, tabs: QTabWidget) -> None:
+        page, form = _form_tab()
+        s = self.settings
+
+        self.tts_mode = QComboBox()
+        self.tts_mode.addItem("Выключена", "off")
+        self.tts_mode.addItem("Только ответы на голосовые вопросы", "voice")
+        self.tts_mode.addItem("Все ответы", "always")
+        self.tts_mode.setCurrentIndex(
+            max(0, self.tts_mode.findData(str(s.get("tts_mode", "off"))))
+        )
+        form.addRow("Озвучка ответов", self.tts_mode)
+
+        self.tts_rate = QSpinBox()
+        self.tts_rate.setRange(-10, 10)
+        self.tts_rate.setValue(int(s.get("tts_rate", 0)))
+        self.tts_rate.setToolTip("−10 — медленно, 0 — обычно, 10 — быстро")
+        form.addRow("Скорость речи", self.tts_rate)
+
+        self.tts_volume = QSpinBox()
+        self.tts_volume.setRange(0, 100)
+        self.tts_volume.setSuffix(" %")
+        self.tts_volume.setValue(int(s.get("tts_volume", 100)))
+        form.addRow("Громкость", self.tts_volume)
+
+        self.tts_voice = QLineEdit(str(s.get("tts_voice", "")))
+        self.tts_voice.setPlaceholderText("по умолчанию — голос языка распознавания")
+        form.addRow("Имя голоса Windows", self.tts_voice)
+
+        hint = QLabel(
+            "Используются встроенные голоса Windows (офлайн). Русский голос "
+            "ставится в Параметры → Время и язык → Речь. Пока ассистент "
+            "говорит, захват системного звука приглушается, чтобы он не "
+            "слышал сам себя; прервать речь можно клавишей Esc."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        tabs.addTab(page, "Озвучка")
 
     def _build_window_tab(self, tabs: QTabWidget) -> None:
         page, form = _form_tab()
@@ -306,7 +385,10 @@ class SettingsDialog(QDialog):
             return
         self.models_status.setText("Проверяю Ollama…")
         self.refresh_button.setEnabled(False)
-        self._worker = _ModelsWorker(self.ollama_url.text().strip(), self)
+        url = normalize_ollama_url(self.ollama_url.text()) or str(
+            DEFAULT_SETTINGS["ollama_url"]
+        )
+        self._worker = _ModelsWorker(url, self)
         self._worker.loaded.connect(self._on_models_loaded)
         self._worker.start()
 
@@ -371,16 +453,23 @@ class SettingsDialog(QDialog):
             "ollama_url": self.ollama_url.text().strip(),
             "answer_model": self.answer_model.currentText().strip(),
             "classifier_model": self.classifier_model.currentText().strip(),
+            "warm_up_model": self.warm_up.isChecked(),
             "num_ctx": int(self.num_ctx.value()),
             "temperature": float(self.temperature.value()),
             "language": self.language.currentData(),
-            "whisper_model": self.whisper_model.currentText(),
+            "whisper_model": self.whisper_model.currentText().strip(),
             "whisper_device": self.whisper_device.currentData(),
             "audio_device": self.audio_device.currentData(),
             "silence_threshold": float(self.threshold.value()),
             "silence_duration": float(self.silence.value()),
             "hotkey": hotkey,
             "filter_background_speech": self.filter_speech.isChecked(),
+            "filter_mode": self.filter_mode.currentData(),
+            "log_transcripts": self.log_transcripts.isChecked(),
+            "tts_mode": self.tts_mode.currentData(),
+            "tts_rate": int(self.tts_rate.value()),
+            "tts_volume": int(self.tts_volume.value()),
+            "tts_voice": self.tts_voice.text().strip(),
             "require_assistant_name": self.require_name.isChecked(),
             "assistant_names": names,
             "background_alpha": int(self.opacity.value()),

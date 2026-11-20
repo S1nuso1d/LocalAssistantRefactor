@@ -5,6 +5,7 @@ worker stay a thin I/O shell around it.
 """
 from __future__ import annotations
 
+import queue
 from collections import deque
 
 import numpy as np
@@ -92,3 +93,22 @@ def segment_is_reliable(
     if avg_logprob is not None and avg_logprob < -1.8:
         return False
     return True
+
+
+def put_drop_oldest(target: "queue.Queue", item) -> bool:
+    """Enqueue *item*; when full, discard the oldest entry instead.
+
+    Returns True if something was dropped. Used so a slow recogniser never
+    makes the capture thread block or build an unbounded backlog.
+    """
+    dropped = False
+    while True:
+        try:
+            target.put_nowait(item)
+            return dropped
+        except queue.Full:
+            try:
+                target.get_nowait()
+                dropped = True
+            except queue.Empty:
+                pass

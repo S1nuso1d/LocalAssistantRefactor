@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "num_ctx": 8192,
     "temperature": 0.3,
     "keep_alive": "10m",
+    "warm_up_model": True,
+    "log_transcripts": False,
     "answer_timeout": 180,
     "classifier_timeout": 90,
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
@@ -51,6 +54,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "always_on_top": True,
     "hide_from_capture": True,
     "filter_background_speech": True,
+    "filter_mode": "balanced",
+    "tts_mode": "off",
+    "tts_rate": 0,
+    "tts_volume": 100,
+    "tts_voice": "",
     "require_assistant_name": False,
     "assistant_names": list(DEFAULT_ASSISTANT_NAMES),
     "max_history_messages": 16,
@@ -68,11 +76,19 @@ _RULES: dict[str, tuple[str, Any, Any, tuple | None]] = {
     "background_alpha": ("int", 175, 250, None),
     "max_history_messages": ("int", 2, 100, None),
     "whisper_device": ("str", None, None, ("cpu", "cuda", "auto")),
-    "whisper_model": ("str", None, None, (
-        "tiny", "base", "small", "medium", "large-v3",
-    )),
-    "language": ("str", None, None, ("ru", "en", "auto")),
+    # Any faster-whisper model name or local path is allowed (large-v3-turbo,
+    # distil-*, ...); a bad name surfaces as a clear error when loading.
+    "whisper_model": ("nonempty_str", None, None, None),
+    # Whisper language code ("ru", "de", "zh", ...) or "auto".
+    "language": ("regex", r"auto|[a-z]{2,3}", None, None),
+    "filter_mode": ("str", None, None, ("fast", "balanced")),
+    "tts_mode": ("str", None, None, ("off", "voice", "always")),
+    "tts_rate": ("int", -10, 10, None),
+    "tts_volume": ("int", 0, 100, None),
+    "tts_voice": ("str", None, None, None),
     "compact_mode": ("bool", None, None, None),
+    "warm_up_model": ("bool", None, None, None),
+    "log_transcripts": ("bool", None, None, None),
     "always_on_top": ("bool", None, None, None),
     "hide_from_capture": ("bool", None, None, None),
     "filter_background_speech": ("bool", None, None, None),
@@ -81,12 +97,36 @@ _RULES: dict[str, tuple[str, Any, Any, tuple | None]] = {
     "window_geometry": ("geometry", None, None, None),
     "answer_model": ("nonempty_str", None, None, None),
     "classifier_model": ("nonempty_str", None, None, None),
-    "ollama_url": ("nonempty_str", None, None, None),
+    "ollama_url": ("url", None, None, None),
     "system_prompt": ("nonempty_str", None, None, None),
     "hotkey": ("nonempty_str", None, None, None),
     "keep_alive": ("nonempty_str", None, None, None),
     "audio_device": ("nonempty_str", None, None, None),
 }
+
+
+def normalize_ollama_url(value: str) -> str:
+    """Accept "localhost:11434" or "http://host:11434" and return the chat URL.
+
+    Returns "" if nothing usable was given.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    scheme, _, rest = text.partition("://")
+    host, slash, path = rest.partition("/")
+    if not host:
+        return ""
+    path = path.strip("/")
+    for endpoint in ("api/generate", "api/tags"):
+        if path.endswith(endpoint):  # user pasted another Ollama endpoint
+            path = path[: -len(endpoint)].strip("/")
+            break
+    if not path.endswith("api/chat"):
+        path = f"{path}/api/chat".strip("/")
+    return f"{scheme}://{host}/{path}"
 
 
 def coerce_setting(key: str, value: Any) -> Any:
@@ -118,6 +158,11 @@ def coerce_setting(key: str, value: Any) -> Any:
             if choices and text not in choices:
                 return default
             return text
+        if kind == "regex":
+            text = str(value).strip().lower() if value is not None else ""
+            return text if re.fullmatch(low, text) else default
+        if kind == "url":
+            return normalize_ollama_url(str(value)) or default
         if kind == "str_list":
             if not isinstance(value, (list, tuple)):
                 return list(default)
