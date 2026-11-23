@@ -42,6 +42,7 @@ def main() -> int:
     # this avoids the COM apartment warning triggered by early audio imports.
     app = QApplication(sys.argv)
     app.setApplicationName("Live Assistant")
+    app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
 
     from assistant.ui import AssistantWindow

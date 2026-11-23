@@ -17,6 +17,7 @@ from .config import (
     SYSTEM_PROMPT,
 )
 from .speech_filter import classify_by_rules
+from .text_utils import strip_thinking
 from .settings_store import SettingsStore
 
 logger = logging.getLogger("live_assistant.ollama")
@@ -30,6 +31,7 @@ class OllamaClient:
     def __init__(self, settings_store: SettingsStore | None = None) -> None:
         self.settings = settings_store or SettingsStore()
         self.session = requests.Session()
+        self.last_usage: dict | None = None
         self._active_lock = threading.RLock()
         self._active_response: requests.Response | None = None
 
@@ -87,6 +89,38 @@ class OllamaClient:
     def tags_url(chat_url: str | None = None) -> str:
         base = (chat_url or OLLAMA_URL).rstrip("/")
         return base.rsplit("/api/chat", 1)[0].rstrip("/") + "/api/tags"
+
+    @staticmethod
+    def generate_url(chat_url: str | None = None) -> str:
+        base = (chat_url or OLLAMA_URL).rstrip("/")
+        return base.rsplit("/api/chat", 1)[0].rstrip("/") + "/api/generate"
+
+    def warm_up(self) -> None:
+        """Load the answer model into memory (no tokens are generated).
+
+        The first request otherwise pays the whole model-load time, which for
+        a 30B model can be tens of seconds.
+        """
+        model = str(self.settings.get("answer_model", MODEL_NAME))
+        payload = {
+            "model": model,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": str(self.settings.get("keep_alive", "10m")),
+        }
+        response = None
+        try:
+            response = self.session.post(
+                self.generate_url(self._url()), json=payload, timeout=(5, 300)
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise OllamaError(self._http_error_message(exc, response, model)) from exc
+        except requests.RequestException as exc:
+            raise OllamaError(f"Не удалось загрузить модель: {exc}") from exc
+        finally:
+            if response is not None:
+                response.close()
 
     @staticmethod
     def _normalize_model(name: str) -> str:
@@ -166,14 +200,34 @@ class OllamaClient:
             if response is not None:
                 response.close()
 
-    def classify_ambiguous(self, text: str) -> bool:
+    @staticmethod
+    def format_dialogue_context(context: list[dict[str, str]] | None) -> str:
+        """Compact transcript of the latest turns for the classifier prompt."""
+        lines = []
+        for message in (context or [])[-2:]:
+            who = "Пользователь" if message.get("role") == "user" else "Ассистент"
+            content = strip_thinking(str(message.get("content", ""))).replace("\n", " ")
+            if content.strip():
+                lines.append(f"{who}: {content.strip()[:200]}")
+        return "\n".join(lines)
+
+    def classify_ambiguous(
+        self, text: str, context: list[dict[str, str]] | None = None
+    ) -> bool:
         model = str(self.settings.get("classifier_model", MODEL_NAME))
+        dialogue = self.format_dialogue_context(context)
+        context_block = (
+            f"Последние реплики диалога с ассистентом:\n{dialogue}\n"
+            "Если фраза выглядит как продолжение или уточнение этого диалога, "
+            "выбери true.\n"
+            if dialogue else ""
+        )
         prompt = f"""
 Определи, нужно ли голосовому ИИ-ассистенту отвечать на фразу.
 true — вопрос, просьба, команда или обращение за помощью к ассистенту.
 false — обычный разговор людей между собой, реплика из видео, случайный
 комментарий, шум или обрывок фразы. Если сомневаешься, выбери false.
-Верни только JSON: {{"is_request": true}} или {{"is_request": false}}.
+{context_block}Верни только JSON: {{"is_request": true}} или {{"is_request": false}}.
 Фраза: {text}
 """.strip()
         result = self._post_json(
@@ -215,17 +269,20 @@ false — обычный разговор людей между собой, ре
             f"В ответе классификатора нет корректного is_request: {result[:300]}"
         )
 
-    def should_answer(self, text: str) -> tuple[bool, str]:
+    def should_answer(
+        self, text: str, context: list[dict[str, str]] | None = None
+    ) -> tuple[bool, str]:
         result = classify_by_rules(
             text,
             assistant_names=self.settings.get("assistant_names"),
             require_assistant_name=bool(self.settings.get("require_assistant_name", False)),
+            mode=str(self.settings.get("filter_mode", "balanced")),
         )
         if result == "accept":
             return True, "принято правилами"
         if result == "reject":
             return False, "отсеяно правилами"
-        if self.classify_ambiguous(text):
+        if self.classify_ambiguous(text, context):
             return True, "принято локальной моделью"
         return False, "отсеяно локальной моделью"
 
@@ -238,6 +295,7 @@ false — обычный разговор людей между собой, ре
         """Yield text tokens as Ollama emits NDJSON chunks."""
         model_name = model or str(self.settings.get("answer_model", MODEL_NAME))
         timeout = int(self.settings.get("answer_timeout", ANSWER_TIMEOUT))
+        self.last_usage = None
         payload = {
             "model": model_name,
             "messages": messages,
@@ -276,6 +334,11 @@ false — обычный разговор людей между собой, ре
                     received = True
                     yield str(chunk)
                 if event.get("done"):
+                    self.last_usage = {
+                        key: event[key]
+                        for key in ("prompt_eval_count", "eval_count", "eval_duration")
+                        if isinstance(event.get(key), (int, float))
+                    }
                     break
             if not cancel_event.is_set() and not received:
                 raise OllamaError("Ollama завершила поток без текста ответа.")

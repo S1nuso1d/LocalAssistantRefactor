@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 
 import numpy as np
@@ -22,10 +24,13 @@ from .config import (
     WHISPER_DEVICE,
     WHISPER_MODEL,
 )
-from .segmenter import PhraseSegmenter, segment_is_reliable
+from .privacy import describe_text
+from .segmenter import PhraseSegmenter, put_drop_oldest, segment_is_reliable
 from .settings_store import SettingsStore
 
 logger = logging.getLogger("live_assistant.audio")
+
+TTS_TAIL_SECONDS = 0.8  # room for reverb/buffering after speech ends
 
 
 class AudioWorker(QThread):
@@ -33,12 +38,15 @@ class AudioWorker(QThread):
     status_changed = Signal(str)
     listening_changed = Signal(bool)
     audio_level = Signal(float)
+    segment_dropped = Signal(str)
 
     def __init__(self, settings_store: SettingsStore | None = None) -> None:
         super().__init__()
         self.settings = settings_store or SettingsStore()
         self._running = True
         self._listening = True
+        self._speaking = False
+        self._mute_until = 0.0
         self._whisper = None
 
     def stop(self) -> None:
@@ -54,6 +62,18 @@ class AudioWorker(QThread):
     @property
     def listening(self) -> bool:
         return self._listening
+
+    def set_speaking(self, speaking: bool) -> None:
+        """Mute capture while our own voice plays through the loopback."""
+        self._speaking = bool(speaking)
+        if not speaking:
+            self._mute_until = time.monotonic() + TTS_TAIL_SECONDS
+
+    def _log_text(self) -> bool:
+        return bool(self.settings.get("log_transcripts", False))
+
+    def _is_muted(self) -> bool:
+        return self._speaking or time.monotonic() < self._mute_until
 
     def _loopback_microphone(self):
         selected = str(self.settings.get("audio_device", "По умолчанию"))
@@ -114,7 +134,11 @@ class AudioWorker(QThread):
                     getattr(segment, "avg_logprob", None),
                     getattr(segment, "compression_ratio", None),
                 ):
-                    logger.info("Ненадёжный сегмент отброшен: %s", text)
+                    logger.info(
+                        "Ненадёжный сегмент отброшен: %s",
+                        describe_text(text, self._log_text()),
+                    )
+                    self.segment_dropped.emit(text)
                     continue
                 parts.append(text)
             return " ".join(parts).strip()
@@ -140,10 +164,39 @@ class AudioWorker(QThread):
                 model_name, device="cpu", compute_type="int8"
             )
 
+    def _transcribe_loop(self, phrases: "queue.Queue", stop: threading.Event) -> None:
+        """Recognise phrases off the capture thread so audio is never missed."""
+        while self._running and not stop.is_set():
+            try:
+                phrase = phrases.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if not self._listening:
+                continue  # paused while this phrase was waiting
+            self.status_changed.emit("Распознаю речь…")
+            transcript = self._transcribe(phrase)
+            if transcript and self._listening:
+                logger.info(
+                    "Распознано: %s", describe_text(transcript, self._log_text())
+                )
+                self.phrase_detected.emit(transcript)
+            if self._running and self._listening and phrases.empty():
+                self.status_changed.emit("Слушаю системный звук")
+
     def run(self) -> None:
+        transcriber: threading.Thread | None = None
+        transcriber_stop = threading.Event()
         try:
             self.status_changed.emit("Загружаю модель распознавания…")
             self._load_whisper()
+            phrases: queue.Queue = queue.Queue(maxsize=3)
+            transcriber = threading.Thread(
+                target=self._transcribe_loop,
+                args=(phrases, transcriber_stop),
+                name="whisper-transcriber",
+                daemon=True,
+            )
+            transcriber.start()
             mic = self._loopback_microphone()
             self.status_changed.emit("Слушаю системный звук")
 
@@ -156,7 +209,7 @@ class AudioWorker(QThread):
                 while self._running:
                     try:
                         audio = recorder.record(numframes=CHUNK_FRAMES)
-                        if not self._listening:
+                        if not self._listening or self._is_muted():
                             # Keep draining the device while paused; otherwise
                             # the driver buffer fills with stale audio that
                             # floods the pipeline on resume.
@@ -176,14 +229,8 @@ class AudioWorker(QThread):
 
                         phrase = segmenter.feed(audio, rms, threshold, silence_limit)
                         if phrase is not None:
-                            self.status_changed.emit("Распознаю речь…")
-                            transcript = self._transcribe(phrase)
-                            if transcript:
-                                logger.info("Распознано: %s", transcript)
-                                self.phrase_detected.emit(transcript)
-                            self.audio_level.emit(0.0)
-                            if self._running and self._listening:
-                                self.status_changed.emit("Слушаю системный звук")
+                            if put_drop_oldest(phrases, phrase):
+                                logger.warning("Распознавание не успевает: старая фраза отброшена.")
                     except Exception:
                         logger.exception("Ошибка захвата системного аудио; повторяю.")
                         self.status_changed.emit("Проблема с аудио — пытаюсь восстановить запись")
@@ -191,3 +238,7 @@ class AudioWorker(QThread):
         except Exception as exc:
             logger.exception("Аудиопоток не запущен.")
             self.status_changed.emit(f"Ошибка аудио: {exc}")
+        finally:
+            transcriber_stop.set()
+            if transcriber is not None:
+                transcriber.join(timeout=15)

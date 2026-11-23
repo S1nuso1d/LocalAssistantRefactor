@@ -13,9 +13,13 @@ from PySide6.QtCore import QThread, Signal
 from .conversation_store import ConversationStore
 from .config import MAX_PENDING_VOICE_PHRASES, SYSTEM_PROMPT
 from .ollama_client import OllamaClient, OllamaError
+from .privacy import describe_text
 from .settings_store import SettingsStore
 from .speech_filter import DuplicateFilter
-from .text_utils import strip_thinking
+from .text_utils import (
+    context_is_overflowing, estimate_tokens, format_answer_status,
+    strip_thinking, trim_to_budget,
+)
 
 logger = logging.getLogger("live_assistant.processor")
 
@@ -25,6 +29,8 @@ class MessageProcessor(QThread):
     assistant_message = Signal(str)
     assistant_chunk = Signal(str)
     error_message = Signal(str)
+    answer_finished = Signal(str, bool)  # text, answered_a_voice_question
+    phrase_decision = Signal(str, bool, str)  # text, accepted, reason
     answer_metadata = Signal(str, int)
     typing_changed = Signal(bool)
     status_changed = Signal(str)
@@ -50,6 +56,9 @@ class MessageProcessor(QThread):
         # long answer cannot build up a backlog of stale background questions.
         self._voice_lock = threading.Lock()
         self._voice_texts: deque[str] = deque(maxlen=MAX_PENDING_VOICE_PHRASES)
+        self._trimmed = 0
+        self._prompt_estimate = 0
+        self._overflow_warned_for: int | None = None
 
         saved_id = self.settings.get("active_conversation_id")
         try:
@@ -78,7 +87,13 @@ class MessageProcessor(QThread):
             self._queue.put(("MESSAGE", (text, True)))
             return
         with self._voice_lock:
+            full = len(self._voice_texts) == self._voice_texts.maxlen
+            overflowed = self._voice_texts[0] if full else None
             self._voice_texts.append(text)  # oldest is dropped when full
+        if overflowed:
+            self.phrase_decision.emit(
+                overflowed, False, "устарела: пока шёл ответ, пришли новые фразы"
+            )
         self._queue.put(("VOICE", None))
 
     def clear_conversation(self) -> None:
@@ -101,7 +116,10 @@ class MessageProcessor(QThread):
 
     def cancel_current(self) -> None:
         with self._voice_lock:
+            cleared = list(self._voice_texts)
             self._voice_texts.clear()
+        for text in cleared:
+            self.phrase_decision.emit(text, False, "сброшена кнопкой «Стоп»")
         with self._cancel_lock:
             if self._cancel_event is not None:
                 self._cancel_event.set()
@@ -154,6 +172,17 @@ class MessageProcessor(QThread):
             if content.strip():
                 context.append({"role": message["role"], "content": content})
         prompt = str(self.settings.get("system_prompt", SYSTEM_PROMPT))
+
+        # The message-count limit alone cannot protect the window: a few huge
+        # pasted messages overflow it and Ollama silently drops the oldest
+        # tokens, including the system prompt. Trim by estimated tokens too.
+        num_ctx = int(self.settings.get("num_ctx", 8192))
+        reserve = max(512, num_ctx // 4)  # room for the answer itself
+        budget = max(256, num_ctx - reserve - estimate_tokens(prompt))
+        context, self._trimmed = trim_to_budget(context, budget)
+        self._prompt_estimate = estimate_tokens(prompt) + sum(
+            estimate_tokens(m["content"]) for m in context
+        )
         return [{"role": "system", "content": prompt}] + context
 
     def _run_message(
@@ -165,21 +194,35 @@ class MessageProcessor(QThread):
     ) -> None:
         if not bypass_filter:
             if self._duplicates.is_duplicate(text):
-                logger.info("Повтор голосовой фразы пропущен: %s", text)
+                logger.info(
+                    "Повтор голосовой фразы пропущен: %s",
+                    describe_text(text, self._log_text()),
+                )
+                self.phrase_decision.emit(text, False, "повтор недавней фразы")
                 self.status_changed.emit("Повтор фразы пропущен")
                 return
             if bool(self.settings.get("filter_background_speech", True)):
                 self.status_changed.emit("Анализирую намерение…")
                 try:
-                    accepted, reason = self._client.should_answer(text)
-                    logger.info("Решение фильтра (%s): %s", reason, text)
+                    recent = self.store.context_messages(self._conversation_id, 2)
+                    accepted, reason = self._client.should_answer(text, recent)
+                    logger.info(
+                        "Решение фильтра (%s): %s",
+                        reason, describe_text(text, self._log_text()),
+                    )
                 except OllamaError as exc:
                     logger.exception("Ошибка классификации неоднозначной фразы.")
+                    self.phrase_decision.emit(
+                        text, False, f"классификатор недоступен: {exc}"[:200]
+                    )
                     self.status_changed.emit(f"Ошибка классификатора: {exc}"[:160])
                     return
+                self.phrase_decision.emit(text, accepted, reason)
                 if not accepted:
                     self.status_changed.emit(f"Фраза пропущена фильтром: {reason}")
                     return
+            else:
+                self.phrase_decision.emit(text, True, "фильтр выключен")
 
         if persist_user:
             self.store.add_message(self._conversation_id, "user", text)
@@ -217,7 +260,23 @@ class MessageProcessor(QThread):
                 if cancel_event.is_set():
                     self.status_changed.emit("Генерация остановлена")
                 else:
-                    self.status_changed.emit(f"Ответ готов · {model} · {elapsed_ms / 1000:.1f} с")
+                    self.answer_finished.emit(answer, not bypass_filter)
+                    usage = getattr(self._client, "last_usage", None)
+                    num_ctx = int(self.settings.get("num_ctx", 8192))
+                    self.status_changed.emit(format_answer_status(
+                        model, elapsed_ms / 1000, usage, num_ctx,
+                        self._prompt_estimate, self._trimmed,
+                    ))
+                    if (
+                        context_is_overflowing(usage, num_ctx)
+                        and self._overflow_warned_for != self._conversation_id
+                    ):
+                        self._overflow_warned_for = self._conversation_id
+                        self.error_message.emit(
+                            "Контекст почти заполнен: старые реплики и даже "
+                            "системный промпт могут не учитываться. Увеличьте "
+                            "«Контекст» в Настройки → Модели или начните новый диалог."
+                        )
             elif cancel_event.is_set():
                 self._restore_answer(restore_on_failure)
                 self.status_changed.emit("Генерация остановлена")
@@ -299,6 +358,9 @@ class MessageProcessor(QThread):
             )
             return
 
+    def _log_text(self) -> bool:
+        return bool(self.settings.get("log_transcripts", False))
+
     def _startup_check(self) -> None:
         try:
             ok, message = self._client.check_ready()
@@ -308,6 +370,32 @@ class MessageProcessor(QThread):
         if not ok:
             self.error_message.emit(message)
             self.status_changed.emit("Ollama недоступна")
+            return
+        self.status_changed.emit(message)
+        if bool(self.settings.get("warm_up_model", True)):
+            self._start_warm_up()
+
+    def _start_warm_up(self) -> None:
+        # Separate daemon thread: loading a big model can take minutes and
+        # must neither delay the queue nor block application shutdown.
+        def work() -> None:
+            self.status_changed.emit("Загружаю модель в память…")
+            try:
+                self._client.warm_up()
+            except OllamaError as exc:
+                logger.warning("Прогрев модели не удался: %s", exc)
+                self.status_changed.emit(f"Не удалось загрузить модель: {exc}"[:160])
+                return
+            self.status_changed.emit("Модель загружена и готова")
+
+        threading.Thread(target=work, name="model-warm-up", daemon=True).start()
+
+    def recheck_ollama(self) -> None:
+        """Re-run the connectivity/model check without restarting the app."""
+        self.status_changed.emit("Проверяю Ollama…")
+        threading.Thread(
+            target=self._startup_check, name="ollama-check", daemon=True
+        ).start()
 
     def run(self) -> None:
         self._emit_current_conversation()
