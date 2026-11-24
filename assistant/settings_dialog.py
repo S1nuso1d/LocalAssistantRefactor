@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 
-import soundcard as sc
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -55,18 +54,34 @@ QTabBar::tab:hover { color: white; }
 
 
 class _AudioDevicesWorker(QThread):
-    """Enumerate Windows audio endpoints without blocking the settings UI."""
+    """Enumerate audio endpoints without blocking Qt or importing native APIs at module load."""
 
     loaded = Signal(list, list, list)
+
+    def __init__(self, soundcard_module=None) -> None:
+        super().__init__()
+        self._soundcard_module = soundcard_module
 
     def run(self) -> None:
         speakers: list[tuple[str, str]] = []
         microphones: list[tuple[str, str]] = []
         errors: list[str] = []
+        soundcard_module = self._soundcard_module
+        if soundcard_module is None:
+            try:
+                import soundcard as soundcard_module
+            except Exception as exc:
+                logger.exception("Аудиобиблиотека недоступна.")
+                self.loaded.emit(
+                    speakers, microphones,
+                    [f"аудиобиблиотека: {type(exc).__name__}"],
+                )
+                return
+
         try:
             speakers = [
                 (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
-                for item in sc.all_speakers()
+                for item in soundcard_module.all_speakers()
                 if str(getattr(item, "name", "") or "").strip()
             ]
         except Exception as exc:
@@ -76,7 +91,7 @@ class _AudioDevicesWorker(QThread):
         try:
             microphones = [
                 (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
-                for item in sc.all_microphones(include_loopback=False)
+                for item in soundcard_module.all_microphones(include_loopback=False)
                 if str(getattr(item, "name", "") or "").strip()
             ]
         except Exception as exc:
@@ -545,6 +560,7 @@ class SettingsDialog(QDialog):
         self.audio_devices_status.setText(summary)
 
     def _on_audio_devices_worker_finished(self) -> None:
+        self._audio_devices_worker = None
         self.refresh_audio_devices_button.setEnabled(True)
         self._audio_refresh_selection = None
 
