@@ -935,7 +935,6 @@ class PrivacyTests(unittest.TestCase):
         for name, needles in {
             "audio_worker.py": ("Распознано", "Ненадёжный сегмент"),
             "processor.py": ("Повтор голосовой фразы", "Решение фильтра"),
-            "ollama_client.py": ("Skipping non-JSON Ollama stream line",),
         }.items():
             source = (root / name).read_text(encoding="utf-8")
             for needle in needles:
@@ -943,6 +942,13 @@ class PrivacyTests(unittest.TestCase):
                 call_start = source.rfind("logger.", 0, position)
                 call = source[call_start:position + 220]
                 self.assertIn("describe_text", call, needle)
+
+        ollama_source = (root / "ollama_client.py").read_text(encoding="utf-8")
+        position = ollama_source.index("Skipping non-JSON Ollama stream line")
+        log_start = ollama_source.rfind("logger.", 0, position)
+        log_call = ollama_source[log_start:position + 220]
+        self.assertIn("len(raw_line)", log_call)
+        self.assertNotIn("raw_line[:", log_call)
 
 
 class FlexibleSettingsTests(unittest.TestCase):
