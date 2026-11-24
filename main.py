@@ -1,10 +1,13 @@
 import logging
 import logging.handlers
+import signal
 import sys
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from assistant.settings_store import app_data_dir
+from assistant.shutdown import install_console_interrupt_handler
 
 
 def setup_logging() -> None:
@@ -100,7 +103,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         window.show()
 
-    return app.exec()
+    previous_sigint_handler = install_console_interrupt_handler(
+        window.quit_application,
+        schedule=lambda callback: QTimer.singleShot(0, callback),
+    )
+    try:
+        return app.exec()
+    finally:
+        try:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+        except (OSError, ValueError):
+            logging.getLogger("live_assistant").exception(
+                "Не удалось восстановить обработчик Ctrl+C."
+            )
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ from .text_utils import (
 )
 
 
-BUILD_VERSION = "1.0.0 · 2026.11.24-r23"
+BUILD_VERSION = "1.0.0 · 2026.11.24-r23.3"
 TTS_MODE_LABELS = {
     "off": "выключена",
     "voice": "только ответы на голосовые вопросы",

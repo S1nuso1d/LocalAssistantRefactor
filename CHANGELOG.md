@@ -1,3 +1,11 @@
+## 2026.11.24-r23.3
+
+- Win32 capture-affinity failures now log the affected HWND and the error codes returned by both the modern exclusion mode and the black-rectangle fallback.
+- The user32 bindings now use ctypes error capture correctly, making Windows API refusals diagnosable instead of reporting only a generic failure.
+- CaptureGuard avoids redundant affinity calls after a window has already been protected successfully and contains ordinary Qt object-lifecycle errors inside its application-wide event filter.
+- Ctrl+C in a console-launched session now schedules the same graceful shutdown path as the tray Exit command; repeated interrupts are coalesced while workers stop.
+- Added regression tests for Win32 error formatting and idempotent Ctrl+C shutdown scheduling.
+
 # Changelog
 
 ## 2026.11.24-r23.2
