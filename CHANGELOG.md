@@ -1,3 +1,10 @@
+## 2026.11.24-r23.4
+
+- Centralized the displayed application version in the root VERSION file; source and frozen onedir builds now resolve the same metadata.
+- Removed duplicate push + pull_request workflow runs and added cancellation of stale runs for the same ref.
+- Windows packaging now checks the executable, PyInstaller internal directory and packaged VERSION before uploading the artifact.
+- The uploaded Windows artifact name is derived from VERSION, preventing stale release labels.
+
 ## 2026.11.24-r23.3
 
 - Win32 capture-affinity failures now log the affected HWND and the error codes returned by both the modern exclusion mode and the black-rectangle fallback.

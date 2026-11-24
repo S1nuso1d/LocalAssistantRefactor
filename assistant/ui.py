@@ -39,13 +39,14 @@ from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore, app_data_dir
 from .tray import TrayController
 from .tts import SpeechEngine
+from .version import APP_VERSION
 from .text_utils import (
     extract_code_blocks, format_time, safe_filename, split_thinking,
     stream_interval_ms,
 )
 
 
-BUILD_VERSION = "1.0.0 · 2026.11.24-r23.3"
+BUILD_VERSION = f"1.0.0 · {APP_VERSION}"
 TTS_MODE_LABELS = {
     "off": "выключена",
     "voice": "только ответы на голосовые вопросы",

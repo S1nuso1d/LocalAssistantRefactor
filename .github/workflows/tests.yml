@@ -1,5 +1,11 @@
 name: tests
-on: [push, pull_request]
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unit:
@@ -41,6 +47,13 @@ jobs:
         run: |
           .\.venv\Scripts\python.exe -m compileall -q main.py assistant tests tools
           .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "VERSION is empty." }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Build Windows application
         shell: cmd
         run: build_exe.bat
@@ -51,8 +64,25 @@ jobs:
           Copy-Item README.md dist\LocalAssistant\README.md
           Copy-Item requirements.txt dist\LocalAssistant\requirements.txt
           Copy-Item VERSION dist\LocalAssistant\VERSION
+      - name: Verify Windows package
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $package = "dist\LocalAssistant"
+          $exe = Join-Path $package "LocalAssistant.exe"
+          $internal = Join-Path $package "_internal"
+          $versionFile = Join-Path $package "VERSION"
+          if (!(Test-Path $exe -PathType Leaf)) { throw "LocalAssistant.exe is missing." }
+          if (!(Test-Path $internal -PathType Container)) { throw "PyInstaller _internal directory is missing." }
+          if (!(Test-Path $versionFile -PathType Leaf)) { throw "Packaged VERSION file is missing." }
+          $actualVersion = (Get-Content $versionFile -Raw).Trim()
+          if ($actualVersion -ne $env:EXPECTED_VERSION) { throw "Version mismatch: expected $env:EXPECTED_VERSION, got $actualVersion." }
+          $exeInfo = Get-Item $exe
+          if ($exeInfo.Length -lt 100000) { throw "LocalAssistant.exe is unexpectedly small ($($exeInfo.Length) bytes)." }
+          Write-Host "Verified $($exeInfo.FullName) ($($exeInfo.Length) bytes), version $actualVersion."
       - uses: actions/upload-artifact@v4
         with:
-          name: LocalAssistant-Windows-r23.2
+          name: LocalAssistant-Windows-${{ steps.version.outputs.value }}
           path: dist/LocalAssistant/
           if-no-files-found: error
