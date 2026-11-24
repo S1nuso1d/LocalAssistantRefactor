@@ -79,8 +79,12 @@ class ConversationStore:
             row = conn.execute("SELECT 1 FROM conversations WHERE id=?", (conversation_id,)).fetchone()
             return row is not None
 
-    def list_conversations(self, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def list_conversations(
+        self, query: str = "", limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
         query = query.strip()
+        limit = max(1, min(500, int(limit)))
+        offset = max(0, int(offset))
         with self._connection() as conn:
             if query:
                 like = f"%{escape_like(query)}%"
@@ -89,12 +93,12 @@ class ConversationStore:
                     FROM conversations c
                     LEFT JOIN messages m ON m.conversation_id=c.id
                     WHERE c.title LIKE ? ESCAPE '\\' OR m.content LIKE ? ESCAPE '\\'
-                    ORDER BY c.updated_at DESC LIMIT ?
-                """, (like, like, limit)).fetchall()
+                    ORDER BY c.updated_at DESC LIMIT ? OFFSET ?
+                """, (like, like, limit, offset)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT ?",
-                    (limit,),
+                    "SELECT id, title, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
                 ).fetchall()
         return [dict(row) for row in rows]
 
@@ -153,12 +157,27 @@ class ConversationStore:
             conn.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
 
     def pop_last_assistant_message(self, conversation_id: int) -> dict[str, Any] | None:
-        """Remove and return the newest assistant message (for safe regenerate)."""
+        """Remove the answer to the latest user message, if one exists.
+
+        An older assistant answer must never be removed when the latest user
+        message has not received a response yet (for example, after a failed
+        request).  Both lookups and the delete happen in one transaction so a
+        concurrent history update cannot make us delete an unrelated answer.
+        """
         with self._connection() as conn:
+            user = conn.execute(
+                "SELECT id FROM messages WHERE conversation_id=? AND role='user' "
+                "ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if user is None:
+                return None
+
             row = conn.execute(
                 "SELECT id, content, model, duration_ms FROM messages "
-                "WHERE conversation_id=? AND role='assistant' ORDER BY id DESC LIMIT 1",
-                (conversation_id,),
+                "WHERE conversation_id=? AND role='assistant' AND id>? "
+                "ORDER BY id DESC LIMIT 1",
+                (conversation_id, int(user["id"])),
             ).fetchone()
             if not row:
                 return None

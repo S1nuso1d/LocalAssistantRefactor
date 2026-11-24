@@ -1,14 +1,161 @@
 name: tests
-on: [push, pull_request]
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt runtime dependency (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install requests numpy PySide6 pypdf python-docx
+      - run: python -m compileall -q main.py assistant tests tools
+      - run: python -m unittest discover -s tests -v
+
+  source-archive:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          test -n "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Create source archive
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          archive="LocalAssistant-Source-${RELEASE_VERSION}.zip"
+          prefix="LocalAssistant-${RELEASE_VERSION}/"
+          git archive --format=zip --prefix="$prefix" HEAD --output="$archive"
+          test -s "$archive"
+          size="$(wc -c < "$archive")"
+          test "$size" -gt 10000
+          echo "Created $archive ($size bytes)."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalAssistant-Source-${{ steps.version.outputs.value }}
+          path: LocalAssistant-Source-${{ steps.version.outputs.value }}.zip
+          if-no-files-found: error
+
+  windows-package:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # The tested modules are Qt-free, so the GUI/audio stack is not needed.
-      - run: python -m pip install requests numpy
-      - run: python -m compileall -q main.py assistant tests
-      - run: python -m unittest discover -s tests -v
+      - name: Create isolated environment
+        shell: pwsh
+        run: |
+          py -3.12 -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+      - name: Run full tests
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          LOCALASSISTANT_FULL_AUDIO_TESTS: "1"
+        run: |
+          .\.venv\Scripts\python.exe -m compileall -q main.py assistant tests tools
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "VERSION is empty." }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Build Windows application
+        shell: cmd
+        run: build_exe.bat
+      - name: Attach exact dependency manifest and release notes
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pip freeze --all | Set-Content -Encoding utf8 dist\LocalAssistant\requirements-lock-win-py312.txt
+          Copy-Item README.md dist\LocalAssistant\README.md
+          Copy-Item requirements.txt dist\LocalAssistant\requirements.txt
+          Copy-Item VERSION dist\LocalAssistant\VERSION
+      - name: Verify Windows package
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $package = "dist\LocalAssistant"
+          $exe = Join-Path $package "LocalAssistant.exe"
+          $internal = Join-Path $package "_internal"
+          $versionFile = Join-Path $package "VERSION"
+          if (!(Test-Path $exe -PathType Leaf)) { throw "LocalAssistant.exe is missing." }
+          if (!(Test-Path $internal -PathType Container)) { throw "PyInstaller _internal directory is missing." }
+          if (!(Test-Path $versionFile -PathType Leaf)) { throw "Packaged VERSION file is missing." }
+          $actualVersion = (Get-Content $versionFile -Raw).Trim()
+          if ($actualVersion -ne $env:EXPECTED_VERSION) { throw "Version mismatch: expected $env:EXPECTED_VERSION, got $actualVersion." }
+          $exeInfo = Get-Item $exe
+          if ($exeInfo.Length -lt 100000) { throw "LocalAssistant.exe is unexpectedly small ($($exeInfo.Length) bytes)." }
+          Write-Host "Verified $($exeInfo.FullName) ($($exeInfo.Length) bytes), version $actualVersion."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalAssistant-Windows-${{ steps.version.outputs.value }}
+          path: dist/LocalAssistant/
+          if-no-files-found: error
+
+  # The installer is a required Windows validation artifact; packaging failures
+  # must fail the workflow instead of silently passing.
+  windows-installer:
+    needs: windows-package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "VERSION is empty." }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - uses: actions/download-artifact@v4
+        with:
+          name: LocalAssistant-Windows-${{ steps.version.outputs.value }}
+          path: dist/LocalAssistant
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=$env:RELEASE_VERSION" "installer\LocalAssistant.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $setup = Get-ChildItem dist-installer -Filter "LocalAssistant-Setup-*.exe" | Select-Object -First 1
+          if ($null -eq $setup -or $setup.Length -lt 1000000) { throw "Installer is missing or unexpectedly small." }
+          Write-Host "Built $($setup.Name) ($($setup.Length) bytes)."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalAssistant-Installer-${{ steps.version.outputs.value }}
+          path: dist-installer/*.exe
+          if-no-files-found: error
