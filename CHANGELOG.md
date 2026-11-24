@@ -1,3 +1,11 @@
+## 2026.11.24-r23.10
+
+- Made the Ollama model-discovery QThread parentless and registry-managed. Closing the settings dialog no longer relies on a fixed 3-second wait before destroying a potentially running QThread.
+- Settings updates are persisted as a candidate snapshot before becoming visible to running components; failed writes leave the previous in-memory and on-disk values intact.
+- Mutable list settings are returned as defensive copies to prevent callers from changing live values outside the settings lock.
+- Document import checks file size with stat() before read_bytes(), while retaining a post-read guard against files that grow during reading.
+- Added regression tests for model-worker lifetime, failed settings persistence, defensive copies and oversized-file preflight.
+
 ## 2026.11.24-r23.6
 
 - Audio settings now provide an explicit refresh action, so newly connected USB, Bluetooth and 2.4 GHz endpoints can be discovered without closing the settings dialog.
