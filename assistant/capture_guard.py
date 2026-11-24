@@ -6,6 +6,7 @@ other top-level widgets receive the same privacy setting as the main window.
 from __future__ import annotations
 
 import logging
+import weakref
 
 from PySide6.QtCore import QEvent, QObject
 from PySide6.QtWidgets import QApplication, QWidget
@@ -23,6 +24,7 @@ class CaptureGuard(QObject):
         super().__init__(parent)
         self._enabled = bool(enabled)
         self._cache = win.AffinityCache()
+        self._watched_widget_ids: set[int] = set()
 
     @property
     def enabled(self) -> bool:
@@ -53,15 +55,47 @@ class CaptureGuard(QObject):
             logger.exception("Ошибка event filter защиты захвата экрана.")
         return False
 
+    def _forget_widget(self, owner_id: int) -> None:
+        self._cache.forget_owner(owner_id)
+        self._watched_widget_ids.discard(owner_id)
+
+    def _watch_widget_lifecycle(self, widget: QWidget, owner_id: int) -> None:
+        if owner_id in self._watched_widget_ids:
+            return
+
+        guard_ref = weakref.ref(self)
+
+        def on_destroyed(*_args, token: int = owner_id) -> None:
+            guard = guard_ref()
+            if guard is not None:
+                guard._forget_widget(token)
+
+        try:
+            widget.destroyed.connect(on_destroyed)
+        except (RuntimeError, TypeError):
+            # Keep the handle tracked: dropping it would prevent a safe reset.
+            logger.exception(
+                "Не удалось подписаться на уничтожение QWidget id=%s.", owner_id
+            )
+            return
+        self._watched_widget_ids.add(owner_id)
+
     def _apply(self, widget: QWidget, hidden: bool, force: bool = False) -> str | None:
         try:
             hwnd = int(widget.winId())
         except (RuntimeError, TypeError, ValueError):
             return None
 
+        owner_id = id(widget)
+        if force:
+            # WinIdChange invalidates all handles previously owned by this widget.
+            self._cache.forget_owner(owner_id)
+
         state, previous = win.apply_protection(
-            self._cache, hwnd, hidden, force=force
+            self._cache, hwnd, hidden, force=force, owner=owner_id
         )
+        if self._cache.owns(owner_id):
+            self._watch_widget_lifecycle(widget, owner_id)
         if state is None:
             return None
 

@@ -192,6 +192,9 @@ class AffinityCache:
         self._limit = max(1, int(limit))
         self._states: dict[int, str] = {}
         self._touched: set[int] = set()
+        # Only handles owned by live Qt widgets are retained here.
+        # CaptureGuard removes them when QObject.destroyed is emitted.
+        self._owners: dict[int, int] = {}
 
     def state(self, hwnd: int) -> str | None:
         return self._states.get(hwnd)
@@ -201,7 +204,9 @@ class AffinityCache:
         "off" must actively reset it)."""
         return hwnd in self._touched
 
-    def record(self, hwnd: int, state: str, *, hidden: bool) -> None:
+    def record(
+        self, hwnd: int, state: str, *, hidden: bool, owner: int | None = None
+    ) -> None:
         if len(self._states) >= self._limit and hwnd not in self._states:
             # Bound state snapshots, but never discard handles that still
             # need their capture affinity reset when protection is disabled.
@@ -211,14 +216,33 @@ class AffinityCache:
 
         if hidden:
             self._touched.add(hwnd)
+            if owner is None:
+                self._owners.pop(hwnd, None)
+            else:
+                self._owners[hwnd] = owner
         elif state == VISIBLE:
             # Remove a handle only after Windows confirms that protection
             # has been successfully disabled. Failed resets remain retryable.
             self._touched.discard(hwnd)
+            self._owners.pop(hwnd, None)
+
+    def owns(self, owner: int) -> bool:
+        """Whether this widget owns a handle that still needs a reset."""
+        return owner in self._owners.values()
+
+    def forget_owner(self, owner: int) -> None:
+        """Forget every protected HWND belonging to a destroyed/recreated widget."""
+        handles = [
+            hwnd for hwnd, tracked_owner in self._owners.items()
+            if tracked_owner == owner
+        ]
+        for hwnd in handles:
+            self.forget(hwnd)
 
     def forget(self, hwnd: int) -> None:
         self._states.pop(hwnd, None)
         self._touched.discard(hwnd)
+        self._owners.pop(hwnd, None)
 
 
 def apply_protection(
@@ -227,6 +251,7 @@ def apply_protection(
     hidden: bool,
     *,
     force: bool = False,
+    owner: int | None = None,
     apply=None,
 ) -> tuple[str | None, str | None]:
     """Decide whether to call Win32 for *hwnd*; return (new_state, previous).
@@ -243,7 +268,7 @@ def apply_protection(
     if hidden and previous in (HIDDEN, BLACK):
         return previous, previous  # already protected: skip repeated calls
     state = apply(hwnd, hidden)
-    cache.record(hwnd, state, hidden=hidden)
+    cache.record(hwnd, state, hidden=hidden, owner=owner)
     return state, previous
 
 

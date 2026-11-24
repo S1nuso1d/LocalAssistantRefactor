@@ -116,13 +116,11 @@ jobs:
           path: dist/LocalAssistant/
           if-no-files-found: error
 
-  # Optional: builds an Inno Setup installer from the verified Windows package.
-  # It never blocks the workflow; the portable artifact above remains the
-  # primary deliverable.
+  # The installer is a required Windows validation artifact; packaging failures
+  # must fail the workflow instead of silently passing.
   windows-installer:
     needs: windows-package
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Read release version

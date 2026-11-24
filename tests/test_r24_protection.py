@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import io
 import unittest
+from unittest.mock import patch
 
 from assistant import winintegration as win
+from assistant.capture_guard import CaptureGuard
 from assistant.shutdown import console_attached
-from assistant.window_visibility import dismiss_open_dialogs, file_dialog_uses_native
+from assistant.window_visibility import (
+    dismiss_open_dialogs, file_dialog_uses_native, restore_tray_dialogs,
+)
 
 
 class FakeAffinityApi:
@@ -147,6 +151,78 @@ class HwndReuseTests(unittest.TestCase):
         self.assertEqual(state, win.VISIBLE)
         self.assertFalse(cache.touched(10))
 
+    def test_destroyed_widget_forgets_all_of_its_hwnds(self):
+        cache, api = win.AffinityCache(), FakeAffinityApi()
+        win.apply_protection(cache, 11, True, owner=101, apply=api)
+        win.apply_protection(cache, 12, True, owner=101, apply=api)
+        win.apply_protection(cache, 13, True, owner=202, apply=api)
+
+        self.assertTrue(cache.owns(101))
+        cache.forget_owner(101)
+
+        self.assertFalse(cache.touched(11))
+        self.assertFalse(cache.touched(12))
+        self.assertTrue(cache.touched(13))
+        self.assertFalse(cache.owns(101))
+        self.assertTrue(cache.owns(202))
+
+
+class FakeDestroyedSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self):
+        for callback in list(self.callbacks):
+            callback()
+
+
+class FakeWidget:
+    def __init__(self, hwnd):
+        self.hwnd = hwnd
+        self.destroyed = FakeDestroyedSignal()
+
+    def winId(self):
+        return self.hwnd
+
+    def destroy(self):
+        self.destroyed.emit()
+
+
+class CaptureGuardLifecycleTests(unittest.TestCase):
+    def test_destroyed_signal_releases_widget_handle(self):
+        guard = CaptureGuard(enabled=True)
+        widget = FakeWidget(0xA01)
+
+        with patch("assistant.winintegration.set_capture_hidden", return_value=win.HIDDEN):
+            guard._apply(widget, True)
+
+        self.assertTrue(guard._cache.touched(0xA01))
+        self.assertTrue(guard._cache.owns(id(widget)))
+
+        widget.destroy()
+
+        self.assertFalse(guard._cache.touched(0xA01))
+        self.assertFalse(guard._cache.owns(id(widget)))
+        self.assertNotIn(id(widget), guard._watched_widget_ids)
+
+    def test_winid_change_releases_previous_handle_before_tracking_new_one(self):
+        guard = CaptureGuard(enabled=True)
+        widget = FakeWidget(0xA02)
+
+        with patch("assistant.winintegration.set_capture_hidden", return_value=win.HIDDEN):
+            guard._apply(widget, True)
+            widget.hwnd = 0xA03
+            guard._apply(widget, True, force=True)
+
+        self.assertFalse(guard._cache.touched(0xA02))
+        self.assertTrue(guard._cache.touched(0xA03))
+        self.assertTrue(guard._cache.owns(id(widget)))
+        widget.destroy()
+        self.assertFalse(guard._cache.touched(0xA03))
+
 
 class FakeDialog:
     def __init__(self, visible=True, raises=False):
@@ -184,6 +260,32 @@ class DismissDialogTests(unittest.TestCase):
         dialog = HideForbidden(True)
         dismiss_open_dialogs([dialog])
         self.assertEqual(dialog.closed, 1)
+
+    def test_busy_dialog_is_temporarily_hidden_and_restored(self):
+        class BusyDialog(FakeDialog):
+            def __init__(self):
+                super().__init__(True)
+                self.tray_hidden = False
+
+            def hide_for_tray(self):
+                self.tray_hidden = True
+                self.visible = False
+                return True
+
+            def restore_from_tray(self):
+                if not self.tray_hidden:
+                    return False
+                self.tray_hidden = False
+                self.visible = True
+                return True
+
+        dialog = BusyDialog()
+        self.assertEqual(dismiss_open_dialogs([dialog]), 1)
+        self.assertEqual(dialog.closed, 0)
+        self.assertFalse(dialog.visible)
+        self.assertEqual(restore_tray_dialogs([dialog]), 1)
+        self.assertTrue(dialog.visible)
+        self.assertFalse(dialog.tray_hidden)
 
 
 class FileDialogPolicyTests(unittest.TestCase):

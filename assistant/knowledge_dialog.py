@@ -164,6 +164,7 @@ class KnowledgeBaseDialog(QDialog):
         self.store = KnowledgeBaseStore()
         self._worker: _DocumentImportWorker | None = None
         self._selected_memory_id: int | None = None
+        self._hidden_for_tray = False
 
         self.setWindowTitle("Локальная база знаний и память")
         self.setMinimumSize(760, 590)
@@ -629,20 +630,41 @@ class KnowledgeBaseDialog(QDialog):
         )
         return True
 
+    def hide_for_tray(self) -> bool:
+        """Hide a busy dialog without closing or cancelling its worker."""
+        if not self._worker_is_running():
+            return False
+        self._hidden_for_tray = True
+        self.hide()
+        return True
+
+    def restore_from_tray(self) -> bool:
+        """Restore a dialog hidden by the main window's tray action."""
+        if not self._hidden_for_tray:
+            return False
+        self._hidden_for_tray = False
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        return True
+
     def accept(self) -> None:
         if self._refuse_close_while_busy():
             return
+        self._hidden_for_tray = False
         super().accept()
 
     def reject(self) -> None:
         if self._refuse_close_while_busy():
             return
+        self._hidden_for_tray = False
         super().reject()
 
     def closeEvent(self, event) -> None:
         if self._refuse_close_while_busy():
             event.ignore()
             return
+        self._hidden_for_tray = False
         super().closeEvent(event)
 
 

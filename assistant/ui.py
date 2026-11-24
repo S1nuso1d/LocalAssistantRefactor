@@ -39,7 +39,7 @@ from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore, app_data_dir
 from .tray import TrayController
-from .window_visibility import dismiss_open_dialogs
+from .window_visibility import dismiss_open_dialogs, restore_tray_dialogs
 from .tts import SpeechEngine
 from .version import APP_VERSION
 from .text_utils import (
@@ -2530,6 +2530,7 @@ class AssistantWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.input.setFocus()
+        restore_tray_dialogs(self.findChildren(QDialog))
 
     def toggle_window_visibility(self):
         if self.isVisible():

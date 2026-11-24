@@ -46,8 +46,27 @@ Name: "{autodesktop}\LocalAssistant"; Filename: "{app}\LocalAssistant.exe"; Task
 [Registry]
 ; Autostart chosen in the installer (same value the in-app setting manages).
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "LocalAssistant"; ValueData: """{app}\LocalAssistant.exe"" --tray"; Flags: uninsdeletevalue; Tasks: autostart
-; Whatever way autostart was enabled, remove it when the program is uninstalled.
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "LocalAssistant"; Flags: dontcreatekey uninsdeletevalue
+; The in-app setting may create this value after installation. The [Code] handler
+; below removes the actual HKCU value on uninstall, regardless of how it was enabled.
 
 [Run]
 Filename: "{app}\LocalAssistant.exe"; Description: "Запустить LocalAssistant"; Flags: nowait postinstall skipifsilent
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    if RegValueExists(
+      HKEY_CURRENT_USER,
+      'Software\Microsoft\Windows\CurrentVersion\Run',
+      'LocalAssistant') then
+    begin
+      if not RegDeleteValue(
+        HKEY_CURRENT_USER,
+        'Software\Microsoft\Windows\CurrentVersion\Run',
+        'LocalAssistant') then
+        Log('Could not remove the LocalAssistant autostart registry value.');
+    end;
+  end;
+end;
