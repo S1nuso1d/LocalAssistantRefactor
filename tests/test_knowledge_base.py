@@ -159,6 +159,27 @@ class KnowledgeTextTests(unittest.TestCase):
         self.assertLessEqual(limit * large_dimensions * 4, MAX_SEMANTIC_SCAN_BYTES)
         self.assertGreaterEqual(limit, 1)
 
+    def test_file_growth_after_stat_is_still_read_with_a_hard_limit(self):
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "growing.txt"
+            path.write_bytes(b"small")
+            stream = Mock()
+            stream.__enter__ = Mock(return_value=stream)
+            stream.__exit__ = Mock(return_value=False)
+            stream.read = Mock(return_value=b"x" * 129)
+
+            with (
+                patch("assistant.knowledge_base.MAX_DOCUMENT_BYTES", 128),
+                patch.object(Path, "stat", return_value=type("Stat", (), {"st_size": 5})()),
+                patch.object(Path, "open", return_value=stream),
+            ):
+                with self.assertRaises(KnowledgeError):
+                    extract_document(path)
+
+            stream.read.assert_called_once_with(129)
+
     def test_oversized_file_is_rejected_before_reading_contents(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "oversized.txt"

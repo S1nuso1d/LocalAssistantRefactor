@@ -152,10 +152,12 @@ def extract_document(
             f"Файл {file_path.name} превышает ограничение {MAX_DOCUMENT_BYTES // (1024 * 1024)} МБ."
         )
 
-    # Reject oversized files before allocating their contents. Keep the
-    # post-read check as a guard against a file that grows after stat().
+    # Read at most one byte above the configured limit. This also closes the
+    # stat/read race: a file that grows after stat() cannot trigger an
+    # unbounded allocation.
     try:
-        data = file_path.read_bytes()
+        with file_path.open("rb") as source:
+            data = source.read(MAX_DOCUMENT_BYTES + 1)
     except OSError as exc:
         raise KnowledgeError(f"Не удалось прочитать файл {file_path.name}: {exc}") from exc
     if not data:
