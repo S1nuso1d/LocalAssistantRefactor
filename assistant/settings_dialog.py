@@ -258,7 +258,9 @@ class SettingsDialog(QDialog):
         device_actions.addWidget(self.refresh_audio_devices_button)
         device_actions.addWidget(self.audio_devices_status, 1)
         form.addRow("Обнаружение", device_actions)
-        self.refresh_audio_devices_button.clicked.connect(self._refresh_audio_devices)
+        self.refresh_audio_devices_button.clicked.connect(
+            lambda _checked=False: self._refresh_audio_devices(preserve_selection=True)
+        )
         self._audio_devices_loaded = False
         self._refresh_audio_devices(preserve_selection=False)
 
@@ -410,11 +412,18 @@ class SettingsDialog(QDialog):
                     -1,
                 )
 
-            if selected_index < 0 and selected_name != "По умолчанию":
-                combo.addItem(f"{selected_name} (не найдено)", selected_id)
+            if selected_index < 0 and (
+                selected_id or (selected_name and selected_name != "По умолчанию")
+            ):
+                missing_name = (
+                    selected_name
+                    if selected_name and selected_name != "По умолчанию"
+                    else f"Устройство …{selected_id[-8:]}"
+                )
+                combo.addItem(f"{missing_name} (не найдено)", selected_id)
                 selected_index = combo.count() - 1
                 combo.setItemData(
-                    selected_index, selected_name, Qt.ItemDataRole.UserRole + 1
+                    selected_index, missing_name, Qt.ItemDataRole.UserRole + 1
                 )
                 combo.setItemData(
                     selected_index,
