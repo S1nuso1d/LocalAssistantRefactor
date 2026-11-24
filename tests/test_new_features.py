@@ -9,7 +9,9 @@ import numpy as np
 
 from assistant.conversation_store import ConversationStore, escape_like
 from assistant.ollama_client import OllamaClient, OllamaError
-from assistant.segmenter import PhraseSegmenter, segment_is_reliable
+from assistant.segmenter import (
+    PhraseSegmenter, segment_is_reliable, speech_activity_ratio,
+)
 from assistant.settings_store import DEFAULT_SETTINGS, SettingsStore
 from assistant.speech_filter import classify_by_rules, is_whisper_hallucination
 from assistant.text_utils import (
@@ -111,6 +113,47 @@ class SegmenterTests(unittest.TestCase):
     def test_too_long_phrase_is_cut(self):
         phrases = self.run_stream([0.1] * 30)
         self.assertGreaterEqual(len(phrases), 1)
+
+    def test_short_click_does_not_start_a_phrase(self):
+        segmenter = PhraseSegmenter(0.5, 0.45, 12.0, 1)
+        audio = np.zeros(8000, dtype=np.float32)
+        audio[:320] = 0.2  # isolated 20 ms click in a 500 ms chunk
+        ratio = speech_activity_ratio(audio, 0.006)
+        rms = float(np.sqrt(np.mean(audio * audio)))
+
+        self.assertAlmostEqual(ratio, 1 / 25)
+        self.assertIsNone(
+            segmenter.feed(
+                audio, rms, 0.01, 0.9,
+                end_threshold=0.0065, activity_ratio=ratio,
+            )
+        )
+        self.assertFalse(segmenter.in_speech)
+
+    def test_sustained_short_utterance_starts_a_phrase(self):
+        segmenter = PhraseSegmenter(0.5, 0.45, 12.0, 1)
+        audio = np.zeros(8000, dtype=np.float32)
+        audio[:1600] = 0.2  # 100 ms of voiced activity
+        ratio = speech_activity_ratio(audio, 0.006)
+        rms = float(np.sqrt(np.mean(audio * audio)))
+
+        self.assertAlmostEqual(ratio, 0.2)
+        segmenter.feed(
+            audio, rms, 0.01, 0.9,
+            end_threshold=0.0065, activity_ratio=ratio,
+        )
+        self.assertTrue(segmenter.in_speech)
+
+    def test_activity_ratio_handles_empty_and_non_finite_audio(self):
+        self.assertEqual(speech_activity_ratio(np.array([], dtype=np.float32), 0.01), 0.0)
+        noisy = np.array([np.nan, np.inf, -np.inf, 0.0], dtype=np.float32)
+        self.assertEqual(speech_activity_ratio(noisy, 0.01, frame_samples=2), 0.0)
+
+    def test_activity_ratio_can_be_omitted_for_legacy_callers(self):
+        segmenter = PhraseSegmenter(0.5, 0.45, 12.0, 0)
+        audio = np.full(8000, 0.1, dtype=np.float32)
+        segmenter.feed(audio, 0.1, 0.01, 0.9)
+        self.assertTrue(segmenter.in_speech)
 
     def test_reliability(self):
         self.assertTrue(segment_is_reliable(0.1, -0.3, 1.2))

@@ -37,6 +37,7 @@ from .segmenter import (
     AdaptiveNoiseGate,
     PhraseSegmenter,
     put_drop_oldest,
+    speech_activity_ratio,
     segment_is_reliable,
 )
 from .settings_store import SettingsStore
@@ -483,10 +484,15 @@ class AudioWorker(QThread):
 
                         start_threshold = gate.start_threshold
                         end_threshold = gate.end_threshold
+                        activity = speech_activity_ratio(
+                            mono, end_threshold,
+                            frame_samples=max(1, int(SAMPLE_RATE * 0.02)),
+                        )
                         phrase = segmenter.feed(
                             mono, rms, start_threshold,
                             float(self.settings.get("silence_duration", SILENCE_DURATION)),
                             end_threshold=end_threshold,
+                            activity_ratio=activity,
                         )
                         # Only learn the noise floor while the segmenter is
                         # outside speech. Long utterances must not teach the

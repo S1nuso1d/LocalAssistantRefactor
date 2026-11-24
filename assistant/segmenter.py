@@ -12,6 +12,42 @@ import math
 import numpy as np
 
 
+MIN_ACTIVE_FRAME_RATIO = 0.12
+
+
+def speech_activity_ratio(
+    audio: np.ndarray,
+    threshold: float,
+    frame_samples: int = 320,
+) -> float:
+    """Return the fraction of short audio frames above an RMS threshold.
+
+    At 16 kHz the default frame is 20 ms. Requiring activity across several
+    frames helps reject isolated clicks that can raise a 500 ms chunk RMS.
+    """
+    values = np.asarray(audio, dtype=np.float32)
+    if values.ndim == 2:
+        values = np.mean(values, axis=1)
+    if values.ndim != 1 or values.size == 0:
+        return 0.0
+    try:
+        threshold_value = float(threshold)
+        frame_size = max(1, int(frame_samples))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(threshold_value) or threshold_value <= 0:
+        return 0.0
+
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    frame_count = (values.size + frame_size - 1) // frame_size
+    padded_size = frame_count * frame_size
+    if padded_size != values.size:
+        values = np.pad(values, (0, padded_size - values.size))
+    frames = values.reshape(frame_count, frame_size)
+    frame_rms = np.sqrt(np.mean(frames * frames, axis=1, dtype=np.float64))
+    return float(np.mean(frame_rms >= threshold_value))
+
+
 class PhraseSegmenter:
     """Energy-based endpointing with a short pre-roll.
 
@@ -51,6 +87,7 @@ class PhraseSegmenter:
         threshold: float,
         silence_limit: float,
         end_threshold: float | None = None,
+        activity_ratio: float | None = None,
     ) -> np.ndarray | None:
         """Consume one chunk; return a finished phrase or None.
 
@@ -59,7 +96,17 @@ class PhraseSegmenter:
         """
         release_threshold = threshold if end_threshold is None else end_threshold
         active_threshold = release_threshold if self._in_speech else threshold
-        if rms >= active_threshold:
+        active = rms >= active_threshold
+        if activity_ratio is not None:
+            try:
+                ratio = float(activity_ratio)
+            except (TypeError, ValueError, OverflowError):
+                ratio = 0.0
+            active = (
+                active and math.isfinite(ratio)
+                and MIN_ACTIVE_FRAME_RATIO <= ratio <= 1.0
+            )
+        if active:
             if not self._in_speech:
                 self._buffer.extend(self._preroll)
                 self._preroll.clear()
