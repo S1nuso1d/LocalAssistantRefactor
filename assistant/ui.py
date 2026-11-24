@@ -1,4 +1,4 @@
-"""Modern dark-glass chat UI for Live Assistant."""
+"""Modern dark-glass chat UI for LocalAssistant."""
 from __future__ import annotations
 
 import ctypes
@@ -11,32 +11,51 @@ from typing import Any
 
 import keyboard
 from PySide6.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF, QPoint, QSize
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF, QPoint,
+    QSize, QUrl
 )
 from PySide6.QtGui import (
-    QFontMetrics, QKeySequence, QPainter, QColor, QPen, QPainterPath, QShortcut
+    QDesktopServices, QFontMetrics, QKeySequence, QPainter, QColor, QPen,
+    QPainterPath, QShortcut
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QGraphicsOpacityEffect,
     QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
-    QPlainTextEdit, QFileDialog
+    QPlainTextEdit, QFileDialog, QSystemTrayIcon
 )
 
 from .audio_worker import AudioWorker
 from .config import DEFAULT_BACKGROUND_ALPHA
+from . import winintegration
+from .capture_guard import CaptureGuard
 from .conversation_store import ConversationStore
+from .diagnostics_dialog import DiagnosticsDialog
 from .history_dialog import HistoryDialog
+from .phrase_log import PhraseLog
+from .phrase_log_dialog import PhraseLogDialog
 from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
-from .settings_store import SettingsStore
-from .text_utils import format_time, safe_filename, split_thinking
+from .settings_store import SettingsStore, app_data_dir
+from .tray import TrayController
+from .tts import SpeechEngine
+from .text_utils import (
+    extract_code_blocks, format_time, safe_filename, split_thinking,
+    stream_interval_ms,
+)
 
 
-BUILD_VERSION = "2026.11.11-r7"
+BUILD_VERSION = "1.0.0 · 2026.11.24-r23"
+TTS_MODE_LABELS = {
+    "off": "выключена",
+    "voice": "только ответы на голосовые вопросы",
+    "always": "все ответы",
+}
+TTS_MODE_ORDER = ("off", "voice", "always")
 WELCOME_TEXT = (
-    "Привет! Я слушаю системный звук. Можешь задать вопрос голосом "
-    "или написать его внизу."
+    "Привет! Я готов принимать голосовые обращения из выбранных аудиоисточников. "
+    "Можешь задать вопрос голосом или написать его внизу. Окно скрывается в трей: "
+    "вернуть его можно кликом по значку или горячей клавишей."
 )
 logger = logging.getLogger("live_assistant.ui")
 
@@ -311,20 +330,6 @@ def enable_acrylic(hwnd: int) -> bool:
         return False
 
 
-def exclude_window_from_capture(hwnd: int, enabled: bool = True) -> None:
-    """Best-effort toggle of exclusion from supported capture APIs."""
-    if sys.platform != "win32":
-        return
-
-    try:
-        # 0x11 = WDA_EXCLUDEFROMCAPTURE, 0x0 = WDA_NONE
-        affinity = 0x00000011 if enabled else 0x00000000
-        result = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, affinity)
-        logger.info("Window capture exclusion=%s result: %s", enabled, bool(result))
-    except Exception:
-        logger.exception("Could not set window capture exclusion.")
-
-
 class IconButton(QPushButton):
     """Minimal vector icon button drawn without external image assets."""
 
@@ -343,6 +348,7 @@ class IconButton(QPushButton):
         "search",
         "settings",
         "history",
+        "activity",
     }
 
     def __init__(
@@ -498,6 +504,15 @@ class IconButton(QPushButton):
             path.moveTo(s * 0.50, s * 0.28)
             path.lineTo(s * 0.50, s * 0.50)
             path.lineTo(s * 0.66, s * 0.60)
+            painter.drawPath(path)
+
+        elif self.icon_name == "activity":
+            path.moveTo(s * 0.10, s * 0.53)
+            path.lineTo(s * 0.29, s * 0.53)
+            path.lineTo(s * 0.40, s * 0.25)
+            path.lineTo(s * 0.57, s * 0.77)
+            path.lineTo(s * 0.70, s * 0.43)
+            path.lineTo(s * 0.90, s * 0.43)
             painter.drawPath(path)
 
         elif self.icon_name == "settings":
@@ -769,7 +784,7 @@ class ChatBubble(QFrame):
             role_color = "#9EADEB"
             link_color = "#B7C5FF"
             code_bg = "rgba(7, 9, 16, 210)"
-            role_text = "Live Assistant"
+            role_text = "LocalAssistant"
             self._margins = (14, 10, 14, 11)
 
         clock = format_time(self.timestamp)
@@ -842,9 +857,72 @@ class ChatBubble(QFrame):
         layout.addWidget(self.role_label)
         layout.addWidget(self.body)
 
+        # One-click "copy" chips for fenced code blocks (assistant only).
+        self._code_blocks: list[tuple[str, str]] = []
+        self.code_row = QWidget()
+        self.code_row.setStyleSheet("background: transparent;")
+        self.code_layout = QHBoxLayout(self.code_row)
+        self.code_layout.setContentsMargins(0, 2, 0, 0)
+        self.code_layout.setSpacing(6)
+        self.code_row.hide()
+        layout.addWidget(self.code_row)
+        self._update_code_row()
+
+    def _update_code_row(self):
+        if self.role != "assistant":
+            return
+        blocks = extract_code_blocks(self.text)
+        if len(blocks) == len(self._code_blocks):
+            self._code_blocks = blocks  # contents may have changed; chips lazy-read
+            return
+        self._code_blocks = blocks
+
+        while self.code_layout.count():
+            item = self.code_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+
+        for index, (language, _code) in enumerate(blocks[:6]):
+            label = language or "код"
+            if len(blocks) > 1:
+                label += f" #{index + 1}"
+            button = QPushButton(f"⧉ {label}")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip("Копировать блок кода")
+            button.setStyleSheet(
+                "QPushButton { background: rgba(255,255,255,12);"
+                " color: #C5CEFF; border: 1px solid rgba(190,200,245,45);"
+                " border-radius: 9px; padding: 3px 10px; font-size: 8pt; }"
+                "QPushButton:hover { background: rgba(140,155,240,55);"
+                " color: white; }"
+            )
+            button.clicked.connect(
+                lambda _checked=False, i=index, b=button, t=label:
+                self._copy_code_block(i, b, t)
+            )
+            self.code_layout.addWidget(button)
+
+        self.code_layout.addStretch(1)
+        self.code_row.setVisible(bool(blocks))
+
+    def _copy_code_block(self, index: int, button: QPushButton, label: str):
+        if index >= len(self._code_blocks):
+            return
+        QApplication.clipboard().setText(self._code_blocks[index][1])
+        button.setText("✓ Скопировано")
+
+        def restore():
+            try:
+                button.setText(f"⧉ {label}")
+            except RuntimeError:
+                pass  # chip was rebuilt or the bubble was deleted
+
+        QTimer.singleShot(1300, restore)
+
     def set_markdown(self, text: str):
         self.raw_text = text
         self.body.setMarkdown(self._display_markdown(text))
+        self._update_code_row()
         self._size_body()
 
     def set_metadata(self, model: str, duration_ms: int):
@@ -932,12 +1010,36 @@ class TypingBubble(QFrame):
 
 class AssistantWindow(QWidget):
     hotkey_toggle_signal = Signal()
+    speaking_changed = Signal(bool)
+    window_toggle_signal = Signal()
 
     def __init__(self):
         super().__init__()
 
         self.settings_store = SettingsStore()
         self.conversation_store = ConversationStore()
+        # Protect every window of the app (dialogs, menus, tooltips too) from
+        # screen capture; installed before anything is shown.
+        self.capture_guard = CaptureGuard(
+            bool(self.settings_store.get("hide_from_capture", True)), self
+        )
+        QApplication.instance().installEventFilter(self.capture_guard)
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        self._audio_source_status = {
+            "system": "Ожидает запуска",
+            "microphone": "Отключён",
+        }
+        self._quitting = False
+        self._window_hotkey_ok = False
+        self.tray: TrayController | None = None
+        # State callbacks arrive from the TTS thread; the Qt signal marshals
+        # them onto the GUI thread.
+        self.phrase_log = PhraseLog()
+        self._phrase_dialog: PhraseLogDialog | None = None
+        self.speech = SpeechEngine(
+            self.settings_store,
+            on_state=lambda speaking: self.speaking_changed.emit(speaking),
+        )
 
         self.audio: AudioWorker | None = None
         self.processor: MessageProcessor | None = None
@@ -958,6 +1060,10 @@ class AssistantWindow(QWidget):
         self._hotkey_registered = False
         self._drag_position = None
         self._generating = False
+        self._task_busy = False
+        self._audio_restart_in_progress = False
+        self._audio_restart_worker: AudioWorker | None = None
+        self._audio_restart_was_listening = True
         self._stick_to_bottom = True
         self._geometry_restored = False
 
@@ -969,7 +1075,7 @@ class AssistantWindow(QWidget):
         self._current_conversation_title = "Новый диалог"
 
         self.setObjectName("mainWindow")
-        self.setWindowTitle("Live Assistant")
+        self.setWindowTitle("LocalAssistant")
         self._set_window_flags()
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.resize(570, 730)
@@ -986,6 +1092,7 @@ class AssistantWindow(QWidget):
 
         self._connect_signals()
         self._install_shortcuts()
+        self._create_tray()
         self.audio.start()
         self.processor.start()
         self._register_hotkey()
@@ -998,6 +1105,11 @@ class AssistantWindow(QWidget):
 
     def _set_window_flags(self):
         flags = Qt.Window | Qt.FramelessWindowHint
+
+        if self._tray_available:
+            # Tool windows get no taskbar button and are absent from Alt+Tab;
+            # the tray icon is the way back to the window.
+            flags |= Qt.Tool
 
         if self.settings_store.get("always_on_top", True):
             flags |= Qt.WindowStaysOnTopHint
@@ -1049,7 +1161,7 @@ class AssistantWindow(QWidget):
             self._shortcuts.append(shortcut)
 
     def _escape_pressed(self):
-        if self._generating:
+        if self._task_busy or self.speech.speaking:
             self._cancel_generation()
 
     def _build_ui(self):
@@ -1069,14 +1181,14 @@ class AssistantWindow(QWidget):
             size=38,
             icon_size=20,
             variant="brand",
-            tooltip="Live Assistant",
+            tooltip="LocalAssistant",
         )
         self.logo_button.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
         title_stack = QVBoxLayout()
         title_stack.setSpacing(4)
 
-        title = QLabel("Live Assistant")
+        title = QLabel("LocalAssistant")
         title.setObjectName("title")
         title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
@@ -1102,7 +1214,7 @@ class AssistantWindow(QWidget):
             size=32,
             icon_size=16,
             variant="danger",
-            tooltip="Остановить генерацию ответа",
+            tooltip="Остановить текущую обработку и озвучку (Esc)",
         )
         self.cancel_button.setVisible(False)
         self.cancel_button.clicked.connect(self._cancel_generation)
@@ -1125,6 +1237,14 @@ class AssistantWindow(QWidget):
         )
         self.history_button.clicked.connect(self._open_history)
 
+        self.diagnostics_button = IconButton(
+            "activity",
+            size=32,
+            icon_size=17,
+            tooltip="Центр диагностики",
+        )
+        self.diagnostics_button.clicked.connect(self._open_diagnostics)
+
         self.more_button = IconButton(
             "more",
             size=32,
@@ -1137,15 +1257,15 @@ class AssistantWindow(QWidget):
             "minimize",
             size=32,
             icon_size=16,
-            tooltip="Свернуть окно",
+            tooltip="Скрыть в трей (Ctrl+Alt+H)",
         )
-        self.minimize_button.clicked.connect(self.showMinimized)
+        self.minimize_button.clicked.connect(self._minimize_clicked)
 
         self.close_button = IconButton(
             "close",
             size=32,
             icon_size=16,
-            tooltip="Закрыть приложение",
+            tooltip="Закрыть окно (приложение останется в трее)",
         )
         self.close_button.clicked.connect(self.close)
 
@@ -1153,6 +1273,7 @@ class AssistantWindow(QWidget):
         header_layout.addLayout(title_stack, 1)
         header_layout.addWidget(self.new_button)
         header_layout.addWidget(self.history_button)
+        header_layout.addWidget(self.diagnostics_button)
         header_layout.addWidget(self.more_button)
         header_layout.addWidget(self.minimize_button)
         header_layout.addWidget(self.close_button)
@@ -1254,10 +1375,22 @@ class AssistantWindow(QWidget):
         return " + ".join(part.strip().capitalize() for part in hotkey.split("+"))
 
     def _connect_audio_signals(self, worker: AudioWorker):
-        worker.phrase_detected.connect(self._on_phrase_detected)
+        worker.phrase_detected_with_source.connect(self._on_phrase_detected)
         worker.status_changed.connect(self._update_status)
+        worker.source_status_changed.connect(self._on_audio_source_status)
         worker.listening_changed.connect(self._update_listening)
         worker.audio_level.connect(self.waveform.set_level)
+        worker.segment_dropped.connect(
+            lambda text: self._on_phrase_decision(
+                text, False, "ненадёжное распознавание (похоже на шум или музыку)"
+            )
+        )
+
+    def _on_audio_source_status(self, source_id: str, status: str):
+        self._audio_source_status[source_id] = str(status)
+        if status.startswith(("Недоступен:", "Выбранное устройство недоступно")):
+            label = "Микрофон" if source_id == "microphone" else "Системный звук"
+            self._update_status(f"{label}: {status}"[:180])
 
     def _connect_signals(self):
         self._connect_audio_signals(self.audio)
@@ -1268,6 +1401,7 @@ class AssistantWindow(QWidget):
         self.processor.assistant_chunk.connect(self._append_stream_chunk)
         self.processor.answer_metadata.connect(self._show_answer_metadata)
         self.processor.typing_changed.connect(self._set_typing)
+        self.processor.busy_changed.connect(self._set_task_busy)
         self.processor.status_changed.connect(self._update_status)
         self.processor.conversation_cleared.connect(self._clear_chat_widgets)
         self.processor.conversation_loaded.connect(self._load_conversation)
@@ -1276,19 +1410,37 @@ class AssistantWindow(QWidget):
         )
 
         self.hotkey_toggle_signal.connect(self.toggle_listening)
+        self.speaking_changed.connect(self._on_speaking_changed)
+        self.processor.phrase_decision.connect(self._on_phrase_decision)
+        self.processor.answer_finished.connect(self._on_answer_finished)
+        self.processor.assistant_message_removed.connect(
+            self._remove_latest_assistant_display
+        )
 
     def _register_hotkey(self):
-        try:
-            hotkey = str(
-                self.settings_store.get("hotkey", "ctrl+shift+space")
-            )
-            keyboard.add_hotkey(hotkey, self.hotkey_toggle_signal.emit)
-            self._hotkey_registered = True
+        registered = False
+        self._window_hotkey_ok = False
 
-        except Exception:
-            logger.exception("Не удалось зарегистрировать горячую клавишу.")
-            self._hotkey_registered = False
+        for key, default, signal in (
+            ("hotkey", "ctrl+shift+space", self.hotkey_toggle_signal),
+            ("toggle_window_hotkey", "ctrl+alt+h", self.window_toggle_signal),
+        ):
+            try:
+                keyboard.add_hotkey(
+                    str(self.settings_store.get(key, default)), signal.emit
+                )
+                registered = True
+                if key == "toggle_window_hotkey":
+                    self._window_hotkey_ok = True
+            except Exception:
+                logger.exception("Не удалось зарегистрировать горячую клавишу %s.", key)
+
+        self._hotkey_registered = registered
+
+        if not registered or not self._window_hotkey_ok:
             self._update_status("Горячая клавиша недоступна")
+
+        self._apply_tray_visibility()
 
     def _unregister_hotkey(self):
         if self._hotkey_registered:
@@ -1419,7 +1571,49 @@ class AssistantWindow(QWidget):
 
         return row, copy_button, retry_button
 
+    def _on_phrase_decision(self, text: str, accepted: bool, reason: str):
+        self.phrase_log.add(text, accepted, reason)
+        if self._phrase_dialog is not None and self._phrase_dialog.isVisible():
+            self._phrase_dialog.reload()
+
+    def _open_phrase_log(self):
+        if self._phrase_dialog is None:
+            self._phrase_dialog = PhraseLogDialog(
+                self,
+                self.phrase_log,
+                lambda text: self.processor.enqueue_text(text, True),
+            )
+        self._phrase_dialog.reload()
+        self._phrase_dialog.show()
+        self._phrase_dialog.raise_()
+        self._phrase_dialog.activateWindow()
+
+    def _on_answer_finished(self, text: str, from_voice: bool):
+        mode = str(self.settings_store.get("tts_mode", "off"))
+        if mode == "always" or (mode == "voice" and from_voice):
+            self.speech.speak(text)
+
+    def _on_speaking_changed(self, speaking: bool):
+        # Mute capture while speaking so the assistant does not hear itself.
+        if self.audio is not None:
+            self.audio.set_speaking(speaking)
+        self._update_stop_visibility()
+        if speaking:
+            self._update_status("Озвучиваю ответ…")
+        elif self.audio is not None and self.audio.listening:
+            self._update_status("Прослушивание активно")
+
+    def _update_stop_visibility(self):
+        self.cancel_button.setVisible(
+            self._task_busy or self.speech.speaking
+        )
+
+    def _set_task_busy(self, enabled: bool):
+        self._task_busy = bool(enabled)
+        self._update_stop_visibility()
+
     def _show_user_message(self, text: str):
+        self.speech.stop()
         self._remove_typing()
 
         for entry in self._message_entries:
@@ -1485,6 +1679,7 @@ class AssistantWindow(QWidget):
                 )
 
             self._streaming_text = ""
+            self._stream_timer.setInterval(stream_interval_ms(0))
 
         self._pending_stream_text += chunk
 
@@ -1503,6 +1698,9 @@ class AssistantWindow(QWidget):
         self._pending_stream_text = ""
 
         self._streaming_bubble.set_markdown(self._streaming_text)
+        self._stream_timer.setInterval(
+            stream_interval_ms(len(self._streaming_text))
+        )
         self._scroll_to_bottom()
 
     def _add_actions_to_existing_stream(self):
@@ -1556,7 +1754,7 @@ class AssistantWindow(QWidget):
 
     def _set_typing(self, enabled: bool):
         self._generating = enabled
-        self.cancel_button.setVisible(enabled)
+        self._update_stop_visibility()
 
         if enabled:
             if self._typing_bubble is not None:
@@ -1609,7 +1807,6 @@ class AssistantWindow(QWidget):
                 break
 
     def _regenerate_last(self):
-        self._remove_latest_assistant_display()
         self.processor.regenerate_last_answer()
 
     def _on_scroll_changed(self, value: int):
@@ -1648,9 +1845,10 @@ class AssistantWindow(QWidget):
     def _load_conversation(
         self, conversation_id: int, title: str, messages: list[dict]
     ):
+        self.speech.stop()
         self._current_conversation_id = conversation_id
         self._current_conversation_title = title
-        self.setWindowTitle(f"Live Assistant — {title}")
+        self.setWindowTitle(f"LocalAssistant — {title}")
 
         self._clear_chat_widgets(show_welcome=False)
 
@@ -1696,7 +1894,7 @@ class AssistantWindow(QWidget):
                     )
                 )
                 self.setWindowTitle(
-                    f"Live Assistant — {self._current_conversation_title}"
+                    f"LocalAssistant — {self._current_conversation_title}"
                 )
                 break
 
@@ -1714,25 +1912,32 @@ class AssistantWindow(QWidget):
         self._stick_to_bottom = True
         self.processor.enqueue_text(text, True)
 
-    def _on_phrase_detected(self, text: str):
+    def _on_phrase_detected(self, text: str, source_id: str = "system"):
         preview = text.strip()
+        source_label = "микрофон" if source_id == "microphone" else "системный звук"
 
         if len(preview) > 180:
             preview = preview[:177] + "…"
 
-        self.transcript_preview.setText(f"Распознано: «{preview}»")
-        self.transcript_preview.setToolTip(text)
+        self.transcript_preview.setText(
+            f"Распознано ({source_label}): «{preview}»"
+        )
+        self.transcript_preview.setToolTip(f"Источник: {source_label}\n{text}")
         self.processor.enqueue_text(text, False)
 
     def _cancel_generation(self):
-        self.processor.cancel_current()
-        self._update_status("Останавливаю генерацию…")
+        self.speech.stop()
+        if self._task_busy:
+            self.processor.cancel_current()
+            self._update_status("Останавливаю обработку…")
 
     def _show_menu(self):
         menu = QMenu(self)
 
         new_action = menu.addAction("Новый диалог\tCtrl+N")
         history_action = menu.addAction("История и поиск…\tCtrl+K")
+        knowledge_action = menu.addAction("База знаний и долговременная память…")
+        diagnostics_action = menu.addAction("Центр диагностики…")
 
         menu.addSeparator()
 
@@ -1743,6 +1948,10 @@ class AssistantWindow(QWidget):
 
         menu.addSeparator()
 
+        log_action = menu.addAction("Журнал фильтра…")
+        recheck_action = menu.addAction("Проверить Ollama")
+        logs_action = menu.addAction("Открыть папку данных и логов")
+        about_action = menu.addAction("О программе…")
         settings_action = menu.addAction("Настройки…\tCtrl+,")
         compact_action = menu.addAction(
             "Обычный размер"
@@ -1757,11 +1966,24 @@ class AssistantWindow(QWidget):
 
         menu.addSeparator()
 
+        hide_action = menu.addAction("Скрыть в трей\tCtrl+Alt+H")
+        quit_action = menu.addAction("Выйти из приложения")
+        menu.addSeparator()
+
         pause_action = menu.addAction(
             "Возобновить прослушивание"
             if not self.audio.listening
             else "Приостановить прослушивание"
         )
+
+        tts_mode = str(self.settings_store.get("tts_mode", "off"))
+        if self.speech.available:
+            tts_action = menu.addAction(
+                f"Озвучка: {TTS_MODE_LABELS.get(tts_mode, tts_mode)}"
+            )
+        else:
+            tts_action = menu.addAction("Озвучка недоступна (нужна Windows)")
+            tts_action.setEnabled(False)
 
         chosen = menu.exec(
             self.more_button.mapToGlobal(
@@ -1777,6 +1999,12 @@ class AssistantWindow(QWidget):
 
         elif chosen == history_action:
             self._open_history()
+
+        elif chosen == knowledge_action:
+            self._open_knowledge_base()
+
+        elif chosen == diagnostics_action:
+            self._open_diagnostics()
 
         elif chosen == rename_action:
             title, ok = QInputDialog.getText(
@@ -1816,6 +2044,18 @@ class AssistantWindow(QWidget):
             if answer == QMessageBox.Yes:
                 self.processor.delete_current_conversation()
 
+        elif chosen == log_action:
+            self._open_phrase_log()
+
+        elif chosen == recheck_action:
+            self.processor.recheck_ollama()
+
+        elif chosen == about_action:
+            self._show_about()
+
+        elif chosen == logs_action:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(app_data_dir())))
+
         elif chosen == settings_action:
             self._open_settings()
 
@@ -1832,13 +2072,88 @@ class AssistantWindow(QWidget):
             self._set_window_flags()
             self.show()
 
+        elif chosen == hide_action:
+            self.hide_to_tray()
+
+        elif chosen == quit_action:
+            self.quit_application()
+
         elif chosen == pause_action:
             self.toggle_listening()
+
+        elif chosen == tts_action:
+            self._cycle_tts_mode()
+
+    def _open_diagnostics(self):
+        """Show a non-blocking support snapshot without exposing transcript data."""
+        try:
+            knowledge_path = (
+                self.processor.knowledge.path
+                if self.processor.knowledge is not None
+                else app_data_dir() / "knowledge.sqlite3"
+            )
+            dialog = DiagnosticsDialog(
+                settings=self.settings_store.all(),
+                conversation_db=self.conversation_store.path,
+                knowledge_db=knowledge_path,
+                audio_status=dict(self._audio_source_status),
+                listening=bool(self.audio and self.audio.listening),
+                speaking=bool(self.speech.speaking),
+                build_version=BUILD_VERSION,
+                parent=self,
+            )
+            dialog.exec()
+        except Exception as exc:
+            logger.exception("Не удалось открыть центр диагностики")
+            QMessageBox.critical(
+                self, "Центр диагностики",
+                f"Не удалось открыть диагностику:\n{exc}",
+            )
+
+    def _open_knowledge_base(self):
+        """Open the document/memory manager using the processor's shared Ollama client."""
+        try:
+            from .knowledge_dialog import KnowledgeBaseDialog
+
+            dialog = KnowledgeBaseDialog(
+                self.settings_store,
+                embedder=self.processor.embed_texts,
+                parent=self,
+            )
+            dialog.exec()
+        except Exception as exc:
+            logger.exception("Не удалось открыть локальную базу знаний")
+            QMessageBox.critical(
+                self, "База знаний",
+                f"Не удалось открыть локальную базу знаний:\n{exc}\n\n"
+                "История диалогов и обычный чат не затронуты.",
+            )
+
+    def _show_about(self):
+        listen_key = str(self.settings_store.get("hotkey", "ctrl+shift+space"))
+        window_key = str(self.settings_store.get("toggle_window_hotkey", "ctrl+alt+h"))
+        QMessageBox.information(
+            self,
+            "О программе",
+            f"LocalAssistant {BUILD_VERSION}\n\n"
+            "Голосовой ассистент: захватывает выбранные аудиоисточники, "
+            "распознаёт речь через Whisper и отвечает через Ollama. "
+            "По умолчанию используется локальная Ollama; если указан удалённый адрес, "
+            "текст запросов и контекст передаются этому серверу.\n\n"
+            f"Пауза прослушивания: {listen_key}\n"
+            f"Показать/скрыть окно: {window_key}\n"
+            "Ctrl+N новый диалог · Ctrl+K история · Ctrl+, настройки · "
+            "Esc остановить\n\n"
+            f"Защита от записи экрана: {self._capture_state_text()}\n\n"
+            f"Данные и логи: {app_data_dir()}",
+        )
 
     def _open_history(self):
         dialog = HistoryDialog(
             self,
-            lambda query: self.processor.list_conversations(query),
+            lambda query, limit, offset: self.processor.list_conversations(
+                query, limit, offset
+            ),
             self._current_conversation_id,
         )
 
@@ -1860,6 +2175,7 @@ class AssistantWindow(QWidget):
             "Экспорт диалога",
             suggested,
             "Markdown (*.md);;Текст (*.txt)",
+            options=QFileDialog.DontUseNativeDialog,
         )
 
         if not path:
@@ -1880,7 +2196,9 @@ class AssistantWindow(QWidget):
 
     def _open_settings(self):
         before = self.settings_store.all()
-        dialog = SettingsDialog(self.settings_store, self)
+        dialog = SettingsDialog(
+            self.settings_store, self, self._capture_state_text
+        )
 
         if dialog.exec() != SettingsDialog.Accepted:
             return
@@ -1895,37 +2213,96 @@ class AssistantWindow(QWidget):
         self.show()
         self._apply_capture_exclusion()
         self.hotkey_label.setText(self._hotkey_hint())
+        self._apply_tray_visibility()
 
         self._unregister_hotkey()
         self._register_hotkey()
 
         audio_restart_needed = any(
             before.get(key) != after.get(key)
-            for key in ("audio_device", "whisper_model", "whisper_device")
+            for key in (
+                "audio_device", "audio_device_id", "system_audio_enabled",
+                "microphone_enabled", "microphone_device", "microphone_device_id",
+                "adaptive_vad_enabled", "vad_sensitivity", "silence_threshold",
+                "silence_duration", "whisper_model", "whisper_device",
+            )
         )
 
         if audio_restart_needed:
             self._restart_audio_worker()
 
-    def _restart_audio_worker(self):
-        old_worker = self.audio
-        old_worker.stop()
+        # A new server address or model deserves an immediate re-check.
+        if any(
+            before.get(key) != after.get(key)
+            for key in ("ollama_url", "answer_model", "classifier_model")
+        ):
+            self.processor.recheck_ollama()
 
-        if old_worker.isRunning() and not old_worker.wait(5000):
-            self._update_status(
-                "Не удалось перезапустить аудио: старый поток ещё занят"
-            )
+    def _restart_audio_worker(self):
+        """Restart audio without blocking the Qt GUI thread.
+
+        Whisper may still be finishing a native inference when settings change.
+        The old QThread is allowed to finish naturally; only its finished signal
+        creates the replacement worker.  Repeated settings changes while a
+        restart is pending are coalesced because the new worker reads the latest
+        SettingsStore snapshot when it starts.
+        """
+        if self._quitting:
+            return
+        if self._audio_restart_in_progress:
+            logger.info("Audio restart already pending; latest settings will be used.")
             return
 
-        was_listening = old_worker.listening
-        old_worker.deleteLater()
+        old_worker = self.audio
+        if old_worker is None:
+            self._start_replacement_audio_worker(True)
+            return
 
-        self.audio = AudioWorker(self.settings_store)
-        self._connect_audio_signals(self.audio)
-        # Keep the pause state across a restart so UI and worker agree.
-        self.audio._listening = was_listening
-        self._update_listening(was_listening)
-        self.audio.start()
+        self._audio_restart_in_progress = True
+        self._audio_restart_worker = old_worker
+        self._audio_restart_was_listening = old_worker.listening
+        self._update_status("Перезапускаю аудиосистему…")
+        old_worker.finished.connect(self._finish_audio_worker_restart)
+
+        if old_worker.isRunning():
+            old_worker.stop()
+        else:
+            QTimer.singleShot(0, self._finish_audio_worker_restart)
+
+    def _finish_audio_worker_restart(self):
+        old_worker = self._audio_restart_worker
+        if old_worker is not None:
+            try:
+                old_worker.finished.disconnect(self._finish_audio_worker_restart)
+            except (RuntimeError, TypeError):
+                pass
+            old_worker.deleteLater()
+            if self.audio is old_worker:
+                self.audio = None
+
+        was_listening = self._audio_restart_was_listening
+        self._audio_restart_worker = None
+        self._audio_restart_in_progress = False
+
+        # A close request may have arrived while Whisper was finishing.  In
+        # that case do not create another worker during application shutdown.
+        if self._quitting:
+            self._finish_close_if_ready()
+            return
+
+        self._start_replacement_audio_worker(was_listening)
+
+    def _start_replacement_audio_worker(self, listening: bool) -> None:
+        if self._quitting:
+            return
+        worker = AudioWorker(self.settings_store)
+        self.audio = worker
+        self._connect_audio_signals(worker)
+        worker.set_listening(listening)
+        worker.start()
+        self._update_status(
+            "Слушаю системный звук" if listening else "Прослушивание на паузе"
+        )
 
     def _toggle_compact_mode(self):
         value = not bool(
@@ -2040,10 +2417,14 @@ class AssistantWindow(QWidget):
         self._apply_capture_exclusion()
 
     def _apply_capture_exclusion(self):
-        exclude_window_from_capture(
-            int(self.winId()),
-            bool(self.settings_store.get("hide_from_capture", True)),
+        self.capture_guard.set_enabled(
+            bool(self.settings_store.get("hide_from_capture", True))
         )
+
+    def _capture_state_text(self) -> str:
+        """Human-readable result of a live read-back of the window affinity."""
+        state = self.capture_guard.state_of(self)
+        return winintegration.STATE_TEXT.get(state, state)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -2073,7 +2454,100 @@ class AssistantWindow(QWidget):
         self._drag_position = None
         super().mouseReleaseEvent(event)
 
+    # ---------------------------------------------------------------
+    # Tray integration
+    # ---------------------------------------------------------------
+
+    def _create_tray(self):
+        if not self._tray_available:
+            logger.warning("Системный трей недоступен: работаю с обычным окном.")
+            return
+
+        self.tray = TrayController(
+            toggle_window=self.toggle_window_visibility,
+            is_window_visible=self.isVisible,
+            toggle_listening=self.toggle_listening,
+            is_listening=lambda: self.audio.listening,
+            cycle_tts=self._cycle_tts_mode,
+            tts_label=lambda: TTS_MODE_LABELS.get(
+                str(self.settings_store.get("tts_mode", "off")), "выключена"
+            ),
+            open_settings=self._open_settings_from_tray,
+            quit_app=self.quit_application,
+            parent=self,
+        )
+        self.window_toggle_signal.connect(self.toggle_window_visibility)
+        self._apply_tray_visibility()
+
+    def _apply_tray_visibility(self):
+        """The icon may be hidden by choice, but never when that would leave
+        no way to get the window back."""
+        if self.tray is None:
+            return
+        wanted = bool(self.settings_store.get("tray_icon_visible", True))
+        self.tray.set_icon_visible(wanted or not self._window_hotkey_ok)
+
+    def _minimize_clicked(self):
+        if self.tray is not None:
+            self.hide_to_tray()
+        else:
+            self.showMinimized()
+
+    def hide_to_tray(self):
+        if self._phrase_dialog is not None:
+            self._phrase_dialog.hide()
+        self.hide()
+
+    def show_from_tray(self):
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.input.setFocus()
+
+    def toggle_window_visibility(self):
+        if self.isVisible():
+            self.hide_to_tray()
+        else:
+            self.show_from_tray()
+
+    def _open_settings_from_tray(self):
+        self.show_from_tray()
+        self._open_settings()
+
+    def _cycle_tts_mode(self):
+        mode = str(self.settings_store.get("tts_mode", "off"))
+        index = TTS_MODE_ORDER.index(mode) if mode in TTS_MODE_ORDER else 0
+        new_mode = TTS_MODE_ORDER[(index + 1) % len(TTS_MODE_ORDER)]
+        self.settings_store.update({"tts_mode": new_mode})
+        if new_mode == "off":
+            self.speech.stop()
+        self._update_status(f"Озвучка: {TTS_MODE_LABELS[new_mode]}")
+
+    def prepare_quit(self):
+        """Called on Windows logoff/shutdown so closing is never refused."""
+        self._quitting = True
+
+    def quit_application(self):
+        self._quitting = True
+        self.close()
+
     def closeEvent(self, event):
+        # The window's own close button only hides it; the app lives on in the
+        # tray until "Выход" is chosen (or Windows is shutting down).
+        if (
+            not self._quitting
+            and self.tray is not None
+            and bool(self.settings_store.get("close_to_tray", True))
+        ):
+            event.ignore()
+            self.hide_to_tray()
+            return
+
+        self._quitting = True
+        self.speech.stop()
+
         if not self._close_pending:
             self._save_geometry()
 
@@ -2111,7 +2585,11 @@ class AssistantWindow(QWidget):
 
             return
 
+        if self.tray is not None:
+            self.tray.shutdown()
+
         event.accept()
+        QTimer.singleShot(0, QApplication.quit)
 
     def _finish_close_if_ready(self):
         audio_running = (

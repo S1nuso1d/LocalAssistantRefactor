@@ -42,13 +42,16 @@ class HistoryDialog(QDialog):
     def __init__(
         self,
         parent,
-        fetch: Callable[[str], list[dict[str, Any]]],
+        fetch: Callable[[str, int, int], list[dict[str, Any]]],
         current_id: int | None,
     ) -> None:
         super().__init__(parent)
         self._fetch = fetch
         self._current_id = current_id
         self.selected_id: int | None = None
+        self._page_size = 100
+        self._offset = 0
+        self._has_more = False
 
         self.setWindowTitle("История диалогов")
         self.setMinimumSize(440, 520)
@@ -75,15 +78,25 @@ class HistoryDialog(QDialog):
         self.hint.setObjectName("hint")
         root.addWidget(self.hint)
 
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("hint")
+        self.error_label.setStyleSheet("color: #FF929F;")
+        self.error_label.setWordWrap(True)
+        root.addWidget(self.error_label)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         close = QPushButton("Закрыть")
         close.clicked.connect(self.reject)
+        self.more_button = QPushButton("Загрузить ещё")
+        self.more_button.clicked.connect(self._load_more)
+        self.more_button.setVisible(False)
         self.open_button = QPushButton("Открыть")
         self.open_button.setObjectName("primary")
         self.open_button.setDefault(True)
         self.open_button.clicked.connect(self._open_current)
         buttons.addWidget(close)
+        buttons.addWidget(self.more_button)
         buttons.addWidget(self.open_button)
         root.addLayout(buttons)
 
@@ -91,7 +104,7 @@ class HistoryDialog(QDialog):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(180)
         self._debounce.timeout.connect(self._reload)
-        self.search.textChanged.connect(lambda _t: self._debounce.start())
+        self.search.textChanged.connect(self._search_changed)
         self.search.returnPressed.connect(self._open_current)
         self.list.itemActivated.connect(lambda _i: self._open_current())
         self.list.itemDoubleClicked.connect(lambda _i: self._open_current())
@@ -109,14 +122,30 @@ class HistoryDialog(QDialog):
             return
         super().keyPressEvent(event)
 
-    def _reload(self) -> None:
+    def _search_changed(self, _text: str) -> None:
+        self._offset = 0
+        self._debounce.start()
+
+    def _reload(self, append: bool = False) -> None:
         query = self.search.text().strip()
+        previous_id = None
+        if append and self.list.currentItem() is not None:
+            previous_id = self.list.currentItem().data(Qt.UserRole)
+        if not append:
+            self._offset = 0
+            self.list.clear()
+        self.error_label.clear()
         try:
-            items = self._fetch(query)
-        except Exception:
-            items = []
-        self.list.clear()
-        for item in items[:100]:
+            items = self._fetch(query, self._page_size + 1, self._offset)
+        except Exception as exc:
+            self.error_label.setText(f"Не удалось загрузить историю: {exc}")
+            self.open_button.setEnabled(self.list.count() > 0)
+            self.more_button.setVisible(False)
+            return
+
+        self._has_more = len(items) > self._page_size
+        visible = items[:self._page_size]
+        for item in visible:
             conv_id = int(item["id"])
             mark = "✓  " if conv_id == self._current_id else ""
             title = str(item.get("title", "Диалог"))[:70]
@@ -125,14 +154,28 @@ class HistoryDialog(QDialog):
             entry.setData(Qt.UserRole, conv_id)
             entry.setToolTip(str(item.get("title", "")))
             self.list.addItem(entry)
+        self._offset += len(visible)
+        self.more_button.setVisible(self._has_more)
+        self.more_button.setEnabled(self._has_more)
         if self.list.count():
-            self.list.setCurrentRow(0)
-            self.hint.setText("Enter — открыть · ↑↓ — выбор · Esc — закрыть")
+            if previous_id is not None:
+                for index in range(self.list.count()):
+                    if self.list.item(index).data(Qt.UserRole) == previous_id:
+                        self.list.setCurrentRow(index)
+                        break
+            elif not append:
+                self.list.setCurrentRow(0)
+            if self._has_more:
+                self.hint.setText(f"Показано {self.list.count()} диалогов · можно загрузить ещё")
+            else:
+                self.hint.setText(f"Показано диалогов: {self.list.count()} · Enter — открыть")
         else:
-            self.hint.setText(
-                "Ничего не найдено" if query else "История пока пуста"
-            )
+            self.hint.setText("Ничего не найдено" if query else "История пока пуста")
         self.open_button.setEnabled(self.list.count() > 0)
+
+    def _load_more(self) -> None:
+        if self._has_more:
+            self._reload(append=True)
 
     def _open_current(self) -> None:
         item = self.list.currentItem()

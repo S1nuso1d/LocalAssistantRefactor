@@ -185,8 +185,16 @@ def classify_by_rules(
     text: str,
     assistant_names=None,
     require_assistant_name: bool | None = None,
+    mode: str = "balanced",
 ) -> str:
-    """Return accept, reject, or ambiguous."""
+    """Return accept, reject, or ambiguous.
+
+    mode="fast": any question/request-looking phrase is accepted at once.
+    mode="balanced": only phrases that are unmistakably addressed to an
+    assistant (explicit "?" or an imperative such as "объясни") are accepted
+    by rules; everything else is left to the classifier. This cuts false
+    answers to lines of a video that merely start with "как" or "что".
+    """
     required = (
         REQUIRE_ASSISTANT_NAME
         if require_assistant_name is None
@@ -205,7 +213,11 @@ def classify_by_rules(
         return "accept"
 
     if looks_like_question(text) or looks_like_request(text):
-        return "ambiguous" if required else "accept"
+        if required:
+            return "ambiguous"
+        if mode == "fast" or "?" in text or looks_like_request(text):
+            return "accept"
+        return "ambiguous"
 
     if is_obvious_background(text):
         return "reject"
@@ -213,7 +225,7 @@ def classify_by_rules(
     # A substantive phrase may be a continuation of the current dialogue.
     # When the assistant name is not mandatory, accept it without asking
     # a classifier that sees the phrase out of context.
-    if not required and is_substantive_utterance(text):
+    if not required and mode == "fast" and is_substantive_utterance(text):
         return "accept"
 
     return "ambiguous"

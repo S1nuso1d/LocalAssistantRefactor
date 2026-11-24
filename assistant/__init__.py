@@ -1,1 +1,1 @@
-"""Live Assistant components."""
+"""LocalAssistant components."""

@@ -5,12 +5,18 @@ import unittest
 from pathlib import Path
 
 from assistant.conversation_store import ConversationStore
-from assistant.settings_store import SettingsStore
+from assistant.settings_store import SettingsStore, coerce_setting
 from assistant.speech_filter import DuplicateFilter, classify_by_rules
 from assistant.ollama_client import OllamaClient
 
 
 class CoreTests(unittest.TestCase):
+    def test_invalid_non_finite_float_settings_fall_back_to_defaults(self):
+        self.assertEqual(coerce_setting("temperature", float("nan")), 0.3)
+        self.assertEqual(coerce_setting("temperature", float("inf")), 0.3)
+        self.assertEqual(coerce_setting("knowledge_max_memories", -10), 0)
+        self.assertEqual(coerce_setting("knowledge_max_memories", 100), 10)
+
     def test_settings_persist(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
@@ -31,6 +37,21 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(messages[1]["model"], "gemma:2b")
             self.assertEqual(len(store.list_conversations("цикл")), 1)
             self.assertEqual(len(store.context_messages(conversation_id, 2)), 2)
+
+    def test_conversation_history_pagination_is_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConversationStore(Path(directory) / "history.sqlite3")
+            ids = [store.create_conversation(f"Диалог {index}") for index in range(7)]
+            first = store.list_conversations(limit=3, offset=0)
+            second = store.list_conversations(limit=3, offset=3)
+            third = store.list_conversations(limit=3, offset=6)
+            self.assertEqual(len(first), 3)
+            self.assertEqual(len(second), 3)
+            self.assertEqual(len(third), 1)
+            all_ids = [row["id"] for row in first + second + third]
+            self.assertEqual(len(all_ids), len(set(all_ids)))
+            self.assertEqual(set(all_ids), set(ids))
+            self.assertEqual(store.list_conversations(limit=3, offset=0)[0]["id"], first[0]["id"])
 
     def test_rules_and_duplicate_filter(self):
         self.assertEqual(classify_by_rules("Объясни, что делает цикл"), "accept")

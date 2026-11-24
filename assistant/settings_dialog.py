@@ -7,12 +7,13 @@ import soundcard as sc
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from . import autostart
 from .ollama_client import OllamaClient
-from .settings_store import DEFAULT_SETTINGS, SettingsStore
+from .settings_store import DEFAULT_SETTINGS, SettingsStore, normalize_ollama_url
 
 logger = logging.getLogger("live_assistant.settings")
 
@@ -76,11 +77,12 @@ def _form_tab() -> tuple[QWidget, QFormLayout]:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, settings: SettingsStore, parent=None):
+    def __init__(self, settings: SettingsStore, parent=None, capture_state=None):
         super().__init__(parent)
         self.settings = settings
+        self._capture_state = capture_state
         self._worker: _ModelsWorker | None = None
-        self.setWindowTitle("Настройки Live Assistant")
+        self.setWindowTitle("Настройки LocalAssistant")
         self.setMinimumWidth(520)
         self.setModal(True)
         self.setStyleSheet(DIALOG_STYLE)
@@ -97,8 +99,10 @@ class SettingsDialog(QDialog):
         root.addWidget(tabs, 1)
         self._build_models_tab(tabs)
         self._build_voice_tab(tabs)
+        self._build_speech_tab(tabs)
         self._build_window_tab(tabs)
         self._build_assistant_tab(tabs)
+        self._build_knowledge_tab(tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Save).setObjectName("save")
@@ -136,6 +140,16 @@ class SettingsDialog(QDialog):
         self.classifier_model.setCurrentText(str(s.get("classifier_model")))
         form.addRow("Модель классификации", self.classifier_model)
 
+        self.embedding_model = QComboBox()
+        self.embedding_model.setEditable(True)
+        self.embedding_model.setCurrentText(str(s.get("embedding_model", "")))
+        self.embedding_model.setToolTip(
+            "Необязательная модель для семантического поиска по документам. "
+            "Например: embeddinggemma или nomic-embed-text. "
+            "Сначала установите её через ollama pull."
+        )
+        form.addRow("Модель эмбеддингов", self.embedding_model)
+
         status_row = QHBoxLayout()
         self.models_status = QLabel("Проверяю Ollama…")
         self.models_status.setObjectName("hint")
@@ -144,6 +158,14 @@ class SettingsDialog(QDialog):
         status_row.addWidget(self.models_status, 1)
         status_row.addWidget(self.refresh_button)
         form.addRow("", status_row)
+
+        self.warm_up = QCheckBox("Загружать модель ответов в память при запуске")
+        self.warm_up.setChecked(bool(s.get("warm_up_model", True)))
+        self.warm_up.setToolTip(
+            "Первый ответ приходит быстрее, но модель занимает память "
+            "видеокарты/ОЗУ, пока приложение открыто."
+        )
+        form.addRow("Прогрев", self.warm_up)
 
         self.num_ctx = QSpinBox()
         self.num_ctx.setRange(1024, 131072)
@@ -176,15 +198,29 @@ class SettingsDialog(QDialog):
         s = self.settings
 
         self.language = QComboBox()
-        self.language.addItem("Русский", "ru")
-        self.language.addItem("English", "en")
-        self.language.addItem("Автоопределение", "auto")
-        self.language.setCurrentIndex(max(0, self.language.findData(str(s.get("language", "ru")))))
+        for title, code in (
+            ("Русский", "ru"), ("English", "en"), ("Українська", "uk"),
+            ("Deutsch", "de"), ("Français", "fr"), ("Español", "es"),
+            ("Italiano", "it"), ("Polski", "pl"), ("Türkçe", "tr"),
+            ("中文", "zh"), ("日本語", "ja"), ("Автоопределение", "auto"),
+        ):
+            self.language.addItem(title, code)
+        saved_language = str(s.get("language", "ru"))
+        if self.language.findData(saved_language) < 0:
+            self.language.addItem(saved_language, saved_language)
+        self.language.setCurrentIndex(self.language.findData(saved_language))
         form.addRow("Язык распознавания", self.language)
 
         self.whisper_model = QComboBox()
-        self.whisper_model.addItems(["tiny", "base", "small", "medium", "large-v3"])
+        self.whisper_model.setEditable(True)
+        self.whisper_model.addItems([
+            "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo",
+        ])
         self.whisper_model.setCurrentText(str(s.get("whisper_model", "base")))
+        self.whisper_model.setToolTip(
+            "Можно ввести любое имя модели faster-whisper или путь к папке. "
+            "large-v3-turbo доступна в новых версиях faster-whisper."
+        )
         form.addRow("Модель Whisper", self.whisper_model)
 
         self.whisper_device = QComboBox()
@@ -196,25 +232,134 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Запуск Whisper", self.whisper_device)
 
+        self.system_audio_enabled = QCheckBox("Захватывать системный звук")
+        self.system_audio_enabled.setChecked(bool(s.get("system_audio_enabled", True)))
+        form.addRow("Источник", self.system_audio_enabled)
+
         self.audio_device = QComboBox()
-        self.audio_device.addItem("По умолчанию", "По умолчанию")
+        self.audio_device.addItem("Устройство по умолчанию", "")
         try:
             speakers = sc.all_speakers()
         except Exception:
             logger.exception("Не удалось получить список устройств вывода.")
             speakers = []
         for speaker in speakers:
-            self.audio_device.addItem(speaker.name, speaker.name)
-        wanted = str(s.get("audio_device", "По умолчанию"))
-        self.audio_device.setCurrentIndex(max(0, self.audio_device.findData(wanted)))
-        form.addRow("Системный звук", self.audio_device)
+            speaker_id = str(getattr(speaker, "id", "") or "")
+            self.audio_device.addItem(speaker.name, speaker_id)
+            self.audio_device.setItemData(
+                self.audio_device.count() - 1, speaker.name, Qt.ItemDataRole.UserRole + 1
+            )
+        wanted_id = str(s.get("audio_device_id", "") or "")
+        wanted_name = str(s.get("audio_device", "По умолчанию"))
+        selected_speaker_index = self.audio_device.findData(wanted_id) if wanted_id else -1
+        if selected_speaker_index < 0 and not wanted_id and wanted_name != "По умолчанию":
+            selected_speaker_index = next(
+                (i for i in range(1, self.audio_device.count())
+                 if self.audio_device.itemText(i).casefold() == wanted_name.casefold()),
+                -1,
+            )
+        if selected_speaker_index < 0 and wanted_name != "По умолчанию":
+            self.audio_device.addItem(f"{wanted_name} (не найдено)", wanted_id)
+            selected_speaker_index = self.audio_device.count() - 1
+            self.audio_device.setItemData(
+                selected_speaker_index, wanted_name, Qt.ItemDataRole.UserRole + 1
+            )
+        self.audio_device.setCurrentIndex(max(0, selected_speaker_index))
+        form.addRow("Устройство вывода", self.audio_device)
+        self.audio_device.setEnabled(self.system_audio_enabled.isChecked())
+        self.system_audio_enabled.toggled.connect(self.audio_device.setEnabled)
+
+        self.microphone_enabled = QCheckBox("Захватывать микрофон")
+        self.microphone_enabled.setChecked(bool(s.get("microphone_enabled", False)))
+        form.addRow("Дополнительный источник", self.microphone_enabled)
+
+        self.microphone_device = QComboBox()
+        self.microphone_device.addItem("Микрофон по умолчанию", "")
+        try:
+            microphones = sc.all_microphones(include_loopback=False)
+        except Exception:
+            logger.exception("Не удалось получить список микрофонов.")
+            microphones = []
+        for microphone in microphones:
+            microphone_id = str(getattr(microphone, "id", "") or "")
+            self.microphone_device.addItem(microphone.name, microphone_id)
+            self.microphone_device.setItemData(
+                self.microphone_device.count() - 1, microphone.name, Qt.ItemDataRole.UserRole + 1
+            )
+        wanted_mic_id = str(s.get("microphone_device_id", "") or "")
+        wanted_mic_name = str(s.get("microphone_device", "По умолчанию"))
+        selected_mic_index = self.microphone_device.findData(wanted_mic_id) if wanted_mic_id else -1
+        if selected_mic_index < 0 and not wanted_mic_id and wanted_mic_name != "По умолчанию":
+            selected_mic_index = next(
+                (i for i in range(1, self.microphone_device.count())
+                 if self.microphone_device.itemText(i).casefold() == wanted_mic_name.casefold()),
+                -1,
+            )
+        if selected_mic_index < 0 and wanted_mic_name != "По умолчанию":
+            self.microphone_device.addItem(f"{wanted_mic_name} (не найдено)", wanted_mic_id)
+            selected_mic_index = self.microphone_device.count() - 1
+            self.microphone_device.setItemData(
+                selected_mic_index, wanted_mic_name, Qt.ItemDataRole.UserRole + 1
+            )
+        self.microphone_device.setCurrentIndex(max(0, selected_mic_index))
+        form.addRow("Микрофон", self.microphone_device)
+        self.microphone_device.setEnabled(self.microphone_enabled.isChecked())
+        self.microphone_enabled.toggled.connect(self.microphone_device.setEnabled)
+
+        self.microphone_during_tts = QCheckBox(
+            "Оставлять микрофон активным во время озвучки ассистента"
+        )
+        self.microphone_during_tts.setChecked(
+            bool(s.get("microphone_during_tts", False))
+        )
+        self.microphone_during_tts.setEnabled(self.microphone_enabled.isChecked())
+        self.microphone_enabled.toggled.connect(
+            self.microphone_during_tts.setEnabled
+        )
+        self.microphone_during_tts.setToolTip(
+            "По умолчанию микрофон приглушается во время TTS, чтобы ассистент "
+            "не распознавал собственный голос. Включайте эту опцию только "
+            "при использовании наушников. Акустического эхоподавления нет."
+        )
+        form.addRow("Во время озвучки", self.microphone_during_tts)
+
+        mic_hint = QLabel(
+            "Микрофон работает параллельно с системным звуком. Во время TTS "
+            "он приглушён по умолчанию; его можно оставить активным для "
+            "наушников. Акустическое эхоподавление пока не реализовано."
+        )
+        mic_hint.setObjectName("hint")
+        mic_hint.setWordWrap(True)
+        form.addRow("Важно", mic_hint)
+
+        self.adaptive_vad = QCheckBox("Автоматически подстраивать чувствительность под фон")
+        self.adaptive_vad.setChecked(bool(s.get("adaptive_vad_enabled", True)))
+        self.adaptive_vad.setToolTip(
+            "Адаптивный энергетический порог оценивает шумовой фон отдельно "
+            "для каждого источника. Whisper VAD продолжает выполнять собственную проверку."
+        )
+        form.addRow("Обнаружение речи", self.adaptive_vad)
+
+        self.vad_sensitivity = QDoubleSpinBox()
+        self.vad_sensitivity.setRange(0.5, 2.0)
+        self.vad_sensitivity.setSingleStep(0.1)
+        self.vad_sensitivity.setDecimals(1)
+        self.vad_sensitivity.setValue(float(s.get("vad_sensitivity", 1.0)))
+        self.vad_sensitivity.setToolTip("Больше значение — выше чувствительность и ниже порог начала речи.")
+        self.vad_sensitivity.setEnabled(self.adaptive_vad.isChecked())
+        self.adaptive_vad.toggled.connect(self.vad_sensitivity.setEnabled)
+        form.addRow("Чувствительность", self.vad_sensitivity)
 
         self.threshold = QDoubleSpinBox()
         self.threshold.setRange(0.001, 0.05)
         self.threshold.setSingleStep(0.001)
         self.threshold.setDecimals(3)
         self.threshold.setValue(float(s.get("silence_threshold", 0.008)))
-        form.addRow("Порог чувствительности", self.threshold)
+        form.addRow("Базовый порог (энергия RMS)", self.threshold)
+        self.threshold.setToolTip(
+            "Используется как исходная точка адаптивного порога. "
+            "При выключенной адаптации становится фиксированным порогом."
+        )
 
         self.silence = QDoubleSpinBox()
         self.silence.setRange(0.4, 2.5)
@@ -227,6 +372,14 @@ class SettingsDialog(QDialog):
         self.hotkey.setPlaceholderText("ctrl+shift+space")
         form.addRow("Горячая клавиша", self.hotkey)
 
+        self.filter_mode = QComboBox()
+        self.filter_mode.addItem("Сбалансированный (точнее, чуть медленнее)", "balanced")
+        self.filter_mode.addItem("Быстрый (отвечает на всё, похожее на вопрос)", "fast")
+        self.filter_mode.setCurrentIndex(
+            max(0, self.filter_mode.findData(str(s.get("filter_mode", "balanced"))))
+        )
+        form.addRow("Режим фильтра", self.filter_mode)
+
         self.filter_speech = QCheckBox("Фильтровать фоновую речь")
         self.filter_speech.setChecked(bool(s.get("filter_background_speech", True)))
         form.addRow("Фильтр", self.filter_speech)
@@ -235,11 +388,66 @@ class SettingsDialog(QDialog):
         self.require_name.setChecked(bool(s.get("require_assistant_name", False)))
         form.addRow("Режим обращения", self.require_name)
 
+        self.log_transcripts = QCheckBox("Писать распознанный текст в лог (для отладки)")
+        self.log_transcripts.setChecked(bool(s.get("log_transcripts", False)))
+        self.log_transcripts.setToolTip(
+            "По умолчанию в лог попадает только длина фразы: системный звук "
+            "может содержать закрытые разговоры."
+        )
+        form.addRow("Приватность лога", self.log_transcripts)
+
         self.assistant_names = QLineEdit(", ".join(s.get("assistant_names") or []))
         self.assistant_names.setPlaceholderText("помощник, ассистент")
         self.assistant_names.setToolTip("Имена через запятую, на которые откликается ассистент.")
         form.addRow("Имена ассистента", self.assistant_names)
-        tabs.addTab(page, "Голос")
+
+        # The extended audio-source controls make this page taller than the
+        # dialog on compact displays; keep every setting reachable by scrolling.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        tabs.addTab(scroll, "Голос")
+
+    def _build_speech_tab(self, tabs: QTabWidget) -> None:
+        page, form = _form_tab()
+        s = self.settings
+
+        self.tts_mode = QComboBox()
+        self.tts_mode.addItem("Выключена", "off")
+        self.tts_mode.addItem("Только ответы на голосовые вопросы", "voice")
+        self.tts_mode.addItem("Все ответы", "always")
+        self.tts_mode.setCurrentIndex(
+            max(0, self.tts_mode.findData(str(s.get("tts_mode", "off"))))
+        )
+        form.addRow("Озвучка ответов", self.tts_mode)
+
+        self.tts_rate = QSpinBox()
+        self.tts_rate.setRange(-10, 10)
+        self.tts_rate.setValue(int(s.get("tts_rate", 0)))
+        self.tts_rate.setToolTip("−10 — медленно, 0 — обычно, 10 — быстро")
+        form.addRow("Скорость речи", self.tts_rate)
+
+        self.tts_volume = QSpinBox()
+        self.tts_volume.setRange(0, 100)
+        self.tts_volume.setSuffix(" %")
+        self.tts_volume.setValue(int(s.get("tts_volume", 100)))
+        form.addRow("Громкость", self.tts_volume)
+
+        self.tts_voice = QLineEdit(str(s.get("tts_voice", "")))
+        self.tts_voice.setPlaceholderText("по умолчанию — голос языка распознавания")
+        form.addRow("Имя голоса Windows", self.tts_voice)
+
+        hint = QLabel(
+            "Используются встроенные голоса Windows (офлайн). Русский голос "
+            "ставится в Параметры → Время и язык → Речь. Пока ассистент "
+            "говорит, захват системного звука приглушается, чтобы он не "
+            "слышал сам себя; прервать речь можно клавишей Esc."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        tabs.addTab(page, "Озвучка")
 
     def _build_window_tab(self, tabs: QTabWidget) -> None:
         page, form = _form_tab()
@@ -266,10 +474,54 @@ class SettingsDialog(QDialog):
         self.hide_capture = QCheckBox("Скрывать окно от записи и демонстрации экрана")
         self.hide_capture.setChecked(bool(s.get("hide_from_capture", True)))
         self.hide_capture.setToolTip(
-            "Best-effort: работает не во всех программах. Выключите, если нужно "
-            "сделать скриншот окна."
+            "Скрываются все окна приложения: главное, меню, настройки, подсказки. "
+            "Работает для программной записи и демонстрации (OBS, Zoom, Teams, "
+            "Discord, скриншоты Windows). Камеру, направленную на монитор, и "
+            "аппаратную карту захвата это не скрывает."
         )
         form.addRow("Приватность", self.hide_capture)
+
+        self.capture_status = QLabel(
+            self._capture_state() if self._capture_state else "—"
+        )
+        self.capture_status.setObjectName("hint")
+        self.capture_status.setWordWrap(True)
+        form.addRow("Статус защиты", self.capture_status)
+
+        privacy_note = QLabel(
+            "Значок в трее и панель задач принадлежат Windows и видны при "
+            "демонстрации всего экрана. Чтобы они не попадали в кадр, "
+            "показывайте отдельное окно/вкладку или перетащите значок в "
+            "скрытую область (стрелка ^), либо отключите показ значка ниже."
+        )
+        privacy_note.setObjectName("hint")
+        privacy_note.setWordWrap(True)
+        form.addRow("", privacy_note)
+
+        self.close_to_tray = QCheckBox("Кнопка закрытия сворачивает в трей, а не выходит")
+        self.close_to_tray.setChecked(bool(s.get("close_to_tray", True)))
+        form.addRow("Трей", self.close_to_tray)
+
+        self.start_in_tray = QCheckBox("Запускать свёрнутым в трей")
+        self.start_in_tray.setChecked(bool(s.get("start_in_tray", False)))
+        form.addRow("", self.start_in_tray)
+
+        self.tray_icon_visible = QCheckBox("Показывать значок в трее")
+        self.tray_icon_visible.setChecked(bool(s.get("tray_icon_visible", True)))
+        self.tray_icon_visible.setToolTip(
+            "Если выключить, окно можно вернуть только горячей клавишей. "
+            "Если горячая клавиша не зарегистрировалась, значок всё равно "
+            "будет показан, чтобы вы не потеряли окно."
+        )
+        form.addRow("", self.tray_icon_visible)
+
+        self.window_hotkey = QLineEdit(str(s.get("toggle_window_hotkey", "ctrl+alt+h")))
+        self.window_hotkey.setPlaceholderText("ctrl+alt+h")
+        form.addRow("Показать/скрыть окно", self.window_hotkey)
+
+        self.autostart = QCheckBox("Запускать вместе с Windows (в трее)")
+        self.autostart.setChecked(autostart.is_enabled())
+        form.addRow("Автозапуск", self.autostart)
         tabs.addTab(page, "Окно")
 
     def _build_assistant_tab(self, tabs: QTabWidget) -> None:
@@ -300,19 +552,72 @@ class SettingsDialog(QDialog):
         layout.addLayout(row)
         tabs.addTab(page, "Ассистент")
 
+    def _build_knowledge_tab(self, tabs: QTabWidget) -> None:
+        page, form = _form_tab()
+        s = self.settings
+
+        self.knowledge_enabled = QCheckBox("Использовать импортированные документы при ответах")
+        self.knowledge_enabled.setChecked(bool(s.get("knowledge_enabled", True)))
+        form.addRow("База знаний", self.knowledge_enabled)
+
+        self.memory_enabled = QCheckBox("Использовать записи долговременной памяти")
+        self.memory_enabled.setChecked(bool(s.get("memory_enabled", True)))
+        form.addRow("Память", self.memory_enabled)
+
+        self.semantic_search_enabled = QCheckBox("Включить семантический поиск по embeddings")
+        self.semantic_search_enabled.setChecked(bool(s.get("semantic_search_enabled", False)))
+        self.semantic_search_enabled.setToolTip(
+            "Требует установленную модель эмбеддингов, выбранную во вкладке «Модели». "
+            "При выключении используется локальный полнотекстовый поиск SQLite FTS5."
+        )
+        form.addRow("Поиск", self.semantic_search_enabled)
+
+        self.knowledge_max_chunks = QSpinBox()
+        self.knowledge_max_chunks.setRange(1, 10)
+        self.knowledge_max_chunks.setValue(int(s.get("knowledge_max_chunks", 5)))
+        form.addRow("Максимум фрагментов документов", self.knowledge_max_chunks)
+
+        self.knowledge_max_memories = QSpinBox()
+        self.knowledge_max_memories.setRange(0, 10)
+        self.knowledge_max_memories.setValue(int(s.get("knowledge_max_memories", 3)))
+        self.knowledge_max_memories.setToolTip("0 — не добавлять записи памяти в контекст ответов.")
+        form.addRow("Максимум записей памяти", self.knowledge_max_memories)
+
+        self.knowledge_max_context_chars = QSpinBox()
+        self.knowledge_max_context_chars.setRange(1000, 16000)
+        self.knowledge_max_context_chars.setSingleStep(500)
+        self.knowledge_max_context_chars.setValue(int(s.get("knowledge_max_context_chars", 7000)))
+        self.knowledge_max_context_chars.setSuffix(" симв.")
+        form.addRow("Бюджет справочного контекста", self.knowledge_max_context_chars)
+
+        note = QLabel(
+            "Документы обрабатываются и хранятся локально в knowledge.sqlite3. "
+            "При включённом семантическом поиске их фрагменты и поисковые запросы "
+            "отправляются на настроенный адрес Ollama для вычисления векторов. "
+            "Если адрес Ollama удалённый, данные будут передаваться этому серверу. "
+            "Полнотекстовый поиск работает без embedding-модели."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        form.addRow("Приватность", note)
+        tabs.addTab(page, "Знания")
+
     # ---- models -----------------------------------------------------
     def _refresh_models(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
         self.models_status.setText("Проверяю Ollama…")
         self.refresh_button.setEnabled(False)
-        self._worker = _ModelsWorker(self.ollama_url.text().strip(), self)
+        url = normalize_ollama_url(self.ollama_url.text()) or str(
+            DEFAULT_SETTINGS["ollama_url"]
+        )
+        self._worker = _ModelsWorker(url, self)
         self._worker.loaded.connect(self._on_models_loaded)
         self._worker.start()
 
     def _on_models_loaded(self, models: list) -> None:
         self.refresh_button.setEnabled(True)
-        for combo in (self.answer_model, self.classifier_model):
+        for combo in (self.answer_model, self.classifier_model, self.embedding_model):
             current = combo.currentText()
             combo.clear()
             combo.addItems(models)
@@ -366,27 +671,77 @@ class SettingsDialog(QDialog):
                 "Пример: ctrl+shift+space",
             )
             return
+        window_hotkey = self.window_hotkey.text().strip() or "ctrl+alt+h"
+        if not self._hotkey_is_valid(window_hotkey):
+            QMessageBox.warning(
+                self, "Горячая клавиша окна",
+                f"Не удалось распознать сочетание «{window_hotkey}».\n"
+                "Пример: ctrl+alt+h",
+            )
+            return
+        if window_hotkey.lower() == hotkey.lower():
+            QMessageBox.warning(
+                self, "Горячие клавиши",
+                "Для паузы прослушивания и для показа окна нужны разные сочетания.",
+            )
+            return
         names = [n.strip() for n in self.assistant_names.text().split(",") if n.strip()]
+        audio_index = self.audio_device.currentIndex()
+        microphone_index = self.microphone_device.currentIndex()
+        audio_device_name = (
+            self.audio_device.itemData(audio_index, Qt.ItemDataRole.UserRole + 1)
+            or self.audio_device.currentText()
+        ) if audio_index > 0 else "По умолчанию"
+        microphone_device_name = (
+            self.microphone_device.itemData(microphone_index, Qt.ItemDataRole.UserRole + 1)
+            or self.microphone_device.currentText()
+        ) if microphone_index > 0 else "По умолчанию"
         values = {
             "ollama_url": self.ollama_url.text().strip(),
             "answer_model": self.answer_model.currentText().strip(),
             "classifier_model": self.classifier_model.currentText().strip(),
+            "embedding_model": self.embedding_model.currentText().strip(),
+            "semantic_search_enabled": self.semantic_search_enabled.isChecked(),
+            "knowledge_enabled": self.knowledge_enabled.isChecked(),
+            "memory_enabled": self.memory_enabled.isChecked(),
+            "knowledge_max_chunks": int(self.knowledge_max_chunks.value()),
+            "knowledge_max_memories": int(self.knowledge_max_memories.value()),
+            "knowledge_max_context_chars": int(self.knowledge_max_context_chars.value()),
+            "warm_up_model": self.warm_up.isChecked(),
             "num_ctx": int(self.num_ctx.value()),
             "temperature": float(self.temperature.value()),
             "language": self.language.currentData(),
-            "whisper_model": self.whisper_model.currentText(),
+            "whisper_model": self.whisper_model.currentText().strip(),
             "whisper_device": self.whisper_device.currentData(),
-            "audio_device": self.audio_device.currentData(),
+            "audio_device": audio_device_name,
+            "audio_device_id": str(self.audio_device.currentData() or ""),
+            "system_audio_enabled": self.system_audio_enabled.isChecked(),
+            "microphone_enabled": self.microphone_enabled.isChecked(),
+            "microphone_during_tts": self.microphone_during_tts.isChecked(),
+            "microphone_device": microphone_device_name,
+            "microphone_device_id": str(self.microphone_device.currentData() or ""),
+            "adaptive_vad_enabled": self.adaptive_vad.isChecked(),
+            "vad_sensitivity": float(self.vad_sensitivity.value()),
             "silence_threshold": float(self.threshold.value()),
             "silence_duration": float(self.silence.value()),
             "hotkey": hotkey,
             "filter_background_speech": self.filter_speech.isChecked(),
+            "filter_mode": self.filter_mode.currentData(),
+            "log_transcripts": self.log_transcripts.isChecked(),
+            "tts_mode": self.tts_mode.currentData(),
+            "tts_rate": int(self.tts_rate.value()),
+            "tts_volume": int(self.tts_volume.value()),
+            "tts_voice": self.tts_voice.text().strip(),
             "require_assistant_name": self.require_name.isChecked(),
             "assistant_names": names,
             "background_alpha": int(self.opacity.value()),
             "compact_mode": self.compact_mode.isChecked(),
             "always_on_top": self.always_on_top.isChecked(),
             "hide_from_capture": self.hide_capture.isChecked(),
+            "close_to_tray": self.close_to_tray.isChecked(),
+            "start_in_tray": self.start_in_tray.isChecked(),
+            "tray_icon_visible": self.tray_icon_visible.isChecked(),
+            "toggle_window_hotkey": window_hotkey,
             "system_prompt": self.system_prompt.toPlainText().strip(),
             "max_history_messages": int(self.max_history.value()),
         }
@@ -395,4 +750,10 @@ class SettingsDialog(QDialog):
         except OSError as exc:
             QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось сохранить настройки:\n{exc}")
             return
+        if self.autostart.isChecked() != autostart.is_enabled():
+            if not autostart.set_enabled(self.autostart.isChecked()):
+                QMessageBox.warning(
+                    self, "Автозапуск",
+                    "Не удалось изменить автозапуск. Остальные настройки сохранены.",
+                )
         self.accept()
