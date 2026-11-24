@@ -115,3 +115,44 @@ jobs:
           name: LocalAssistant-Windows-${{ steps.version.outputs.value }}
           path: dist/LocalAssistant/
           if-no-files-found: error
+
+  # Optional: builds an Inno Setup installer from the verified Windows package.
+  # It never blocks the workflow; the portable artifact above remains the
+  # primary deliverable.
+  windows-installer:
+    needs: windows-package
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) { throw "VERSION is empty." }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - uses: actions/download-artifact@v4
+        with:
+          name: LocalAssistant-Windows-${{ steps.version.outputs.value }}
+          path: dist/LocalAssistant
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc "/DAppVersion=$env:RELEASE_VERSION" "installer\LocalAssistant.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $setup = Get-ChildItem dist-installer -Filter "LocalAssistant-Setup-*.exe" | Select-Object -First 1
+          if ($null -eq $setup -or $setup.Length -lt 1000000) { throw "Installer is missing or unexpectedly small." }
+          Write-Host "Built $($setup.Name) ($($setup.Length) bytes)."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalAssistant-Installer-${{ steps.version.outputs.value }}
+          path: dist-installer/*.exe
+          if-no-files-found: error

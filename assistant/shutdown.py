@@ -31,3 +31,18 @@ def install_console_interrupt_handler(
 
     signal_api.signal(signal_api.SIGINT, handle_interrupt)
     return previous
+
+
+def console_attached(stream: Any = None) -> bool:
+    """True when stdout is an interactive console (a Ctrl+C is possible).
+
+    A windowed build (pythonw, frozen --windowed) has no console, so nothing
+    needs to be polled for signals there.
+    """
+    if stream is None:
+        import sys
+        stream = sys.stdout
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False

@@ -22,8 +22,7 @@ class CaptureGuard(QObject):
     def __init__(self, enabled: bool, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._enabled = bool(enabled)
-        self._touched: set[int] = set()
-        self._last_states: dict[int, str] = {}
+        self._cache = win.AffinityCache()
 
     @property
     def enabled(self) -> bool:
@@ -33,12 +32,19 @@ class CaptureGuard(QObject):
         # This filter is installed application-wide, so it must never let a
         # normal Python exception escape through Qt's C++ event dispatcher.
         try:
+            event_type = event.type()
             if (
-                event.type() in _WATCHED
+                event_type in _WATCHED
                 and isinstance(obj, QWidget)
                 and obj.isWindow()
             ):
-                self._apply(obj, self._enabled)
+                # WinIdChange means a *new* native window: Windows may have
+                # recycled an HWND we cached for a destroyed window, so the
+                # cache must not be trusted for it.
+                self._apply(
+                    obj, self._enabled,
+                    force=event_type == QEvent.Type.WinIdChange,
+                )
         except RuntimeError:
             # Qt may deliver a final event while a wrapped C++ object is being
             # destroyed. There is no useful work left to do for that widget.
@@ -47,25 +53,17 @@ class CaptureGuard(QObject):
             logger.exception("Ошибка event filter защиты захвата экрана.")
         return False
 
-    def _apply(self, widget: QWidget, hidden: bool) -> str | None:
+    def _apply(self, widget: QWidget, hidden: bool, force: bool = False) -> str | None:
         try:
             hwnd = int(widget.winId())
         except (RuntimeError, TypeError, ValueError):
             return None
 
-        if not hidden and hwnd not in self._touched:
+        state, previous = win.apply_protection(
+            self._cache, hwnd, hidden, force=force
+        )
+        if state is None:
             return None
-
-        previous = self._last_states.get(hwnd)
-        if hidden and hwnd in self._touched and previous in _SUCCESS_STATES:
-            # The HWND has already been protected successfully. Avoid calling
-            # the Win32 API for every repeated Show event.
-            return previous
-
-        state = win.set_capture_hidden(hwnd, hidden)
-        if hidden:
-            self._touched.add(hwnd)
-        self._last_states[hwnd] = state
 
         if state in (win.FAILED, win.BLACK) and state != previous:
             logger.warning(

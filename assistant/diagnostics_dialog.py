@@ -6,14 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QApplication, QHeaderView,
 )
 
 from .diagnostics_core import collect_diagnostics, format_diagnostic_report
+from .external_open import open_folder
 from .settings_store import app_data_dir
 
 logger = logging.getLogger("live_assistant.diagnostics")
@@ -184,7 +183,10 @@ class DiagnosticsDialog(QDialog):
         self.footer.setText("Диагностический отчёт скопирован. Он не содержит текст диалогов.")
 
     def open_data_folder(self) -> None:
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(app_data_dir())))
+        open_folder(
+            self, app_data_dir(),
+            bool(self._settings.get("hide_from_capture", True)),
+        )
 
     def closeEvent(self, event) -> None:
         if self._worker is not None and self._worker.isRunning():

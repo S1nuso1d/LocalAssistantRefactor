@@ -178,6 +178,75 @@ def get_capture_state(
         return FAILED
 
 
+class AffinityCache:
+    """Remembers which window handles were already protected.
+
+    Windows recycles HWND values after a window is destroyed, so a cached
+    "protected" verdict is only valid for the *same* native window. Callers
+    must ``forget`` a handle whenever Qt reports that a widget received a
+    (new) native handle; otherwise a fresh tooltip or menu that happens to get
+    a recycled HWND would silently skip protection and be visible in a capture.
+    """
+
+    def __init__(self, limit: int = 512) -> None:
+        self._limit = max(1, int(limit))
+        self._states: dict[int, str] = {}
+        self._touched: set[int] = set()
+
+    def state(self, hwnd: int) -> str | None:
+        return self._states.get(hwnd)
+
+    def touched(self, hwnd: int) -> bool:
+        """True if protection was ever applied to this handle (so a later
+        "off" must actively reset it)."""
+        return hwnd in self._touched
+
+    def record(self, hwnd: int, state: str, *, hidden: bool) -> None:
+        if len(self._states) >= self._limit and hwnd not in self._states:
+            # Bound state snapshots, but never discard handles that still
+            # need their capture affinity reset when protection is disabled.
+            self._states.clear()
+
+        self._states[hwnd] = state
+
+        if hidden:
+            self._touched.add(hwnd)
+        elif state == VISIBLE:
+            # Remove a handle only after Windows confirms that protection
+            # has been successfully disabled. Failed resets remain retryable.
+            self._touched.discard(hwnd)
+
+    def forget(self, hwnd: int) -> None:
+        self._states.pop(hwnd, None)
+        self._touched.discard(hwnd)
+
+
+def apply_protection(
+    cache: AffinityCache,
+    hwnd: int,
+    hidden: bool,
+    *,
+    force: bool = False,
+    apply=None,
+) -> tuple[str | None, str | None]:
+    """Decide whether to call Win32 for *hwnd*; return (new_state, previous).
+
+    ``new_state`` is None when nothing had to be done. ``force`` must be True
+    when the window just received a native handle (see AffinityCache).
+    """
+    apply = apply or set_capture_hidden
+    if force:
+        cache.forget(hwnd)
+    if not hidden and not cache.touched(hwnd):
+        return None, None  # never protected, nothing to undo
+    previous = cache.state(hwnd)
+    if hidden and previous in (HIDDEN, BLACK):
+        return previous, previous  # already protected: skip repeated calls
+    state = apply(hwnd, hidden)
+    cache.record(hwnd, state, hidden=hidden)
+    return state, previous
+
+
 STATE_TEXT = {
     HIDDEN: "Активно: окно исключено из поддерживаемых способов захвата Windows",
     BLACK: "Частично: в записи окно отображается чёрным прямоугольником",

@@ -12,23 +12,24 @@ from typing import Any
 import keyboard
 from PySide6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QPointF, QPoint,
-    QSize, QUrl
+    QSize
 )
 from PySide6.QtGui import (
-    QDesktopServices, QFontMetrics, QKeySequence, QPainter, QColor, QPen,
+    QFontMetrics, QKeySequence, QPainter, QColor, QPen,
     QPainterPath, QShortcut
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QScrollArea, QSizePolicy, QGraphicsOpacityEffect,
     QMenu, QTextBrowser, QInputDialog, QMessageBox, QSizeGrip,
-    QPlainTextEdit, QFileDialog, QSystemTrayIcon
+    QPlainTextEdit, QFileDialog, QSystemTrayIcon, QDialog
 )
 
 from .audio_worker import AudioWorker
 from .config import DEFAULT_BACKGROUND_ALPHA
 from . import winintegration
 from .capture_guard import CaptureGuard
+from .external_open import open_folder
 from .conversation_store import ConversationStore
 from .diagnostics_dialog import DiagnosticsDialog
 from .history_dialog import HistoryDialog
@@ -38,6 +39,7 @@ from .processor import MessageProcessor
 from .settings_dialog import SettingsDialog
 from .settings_store import SettingsStore, app_data_dir
 from .tray import TrayController
+from .window_visibility import dismiss_open_dialogs
 from .tts import SpeechEngine
 from .version import APP_VERSION
 from .text_utils import (
@@ -2070,7 +2072,10 @@ class AssistantWindow(QWidget):
             self._show_about()
 
         elif chosen == logs_action:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(app_data_dir())))
+            open_folder(
+                self, app_data_dir(),
+                bool(self.settings_store.get("hide_from_capture", True)),
+            )
 
         elif chosen == settings_action:
             self._open_settings()
@@ -2510,6 +2515,10 @@ class AssistantWindow(QWidget):
             self.showMinimized()
 
     def hide_to_tray(self):
+        # "Hide" must hide everything: modal dialogs (settings, knowledge base,
+        # diagnostics, history) are separate windows and would otherwise stay
+        # on screen after the main window disappears.
+        dismiss_open_dialogs(self.findChildren(QDialog))
         if self._phrase_dialog is not None:
             self._phrase_dialog.hide()
         self.hide()

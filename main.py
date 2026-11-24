@@ -7,7 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from assistant.settings_store import app_data_dir
-from assistant.shutdown import install_console_interrupt_handler
+from assistant.shutdown import console_attached, install_console_interrupt_handler
 
 
 def setup_logging() -> None:
@@ -107,6 +107,16 @@ def main(argv: list[str] | None = None) -> int:
         window.quit_application,
         schedule=lambda callback: QTimer.singleShot(0, callback),
     )
+    # Python-level signal handlers only run while the interpreter executes
+    # bytecode, but Qt's event loop sits in C++. In a console session a
+    # light heartbeat gives Python a regular chance to see Ctrl+C. Windowed
+    # builds have no console, so no timer is needed there.
+    heartbeat = None
+    if console_attached():
+        heartbeat = QTimer()
+        heartbeat.setInterval(250)
+        heartbeat.timeout.connect(lambda: None)
+        heartbeat.start()
     try:
         return app.exec()
     finally:

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from .embeddings import EmbeddingError
 from .knowledge_base import KnowledgeBaseStore, KnowledgeCancelled, KnowledgeError
 from .settings_store import SettingsStore
+from .window_visibility import file_dialog_uses_native
 
 logger = logging.getLogger("live_assistant.knowledge_ui")
 
@@ -413,11 +414,19 @@ class KnowledgeBaseDialog(QDialog):
         self.documents_table.resizeRowsToContents()
 
     def _choose_documents(self) -> None:
+        dialog_options: dict = {}
+        if not file_dialog_uses_native(
+            bool(self.settings.get("hide_from_capture", True))
+        ):
+            # A native Windows dialog is its own OS window and would be
+            # visible in a screen share; Qt's own dialog is protected.
+            dialog_options["options"] = QFileDialog.DontUseNativeDialog
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Добавить документы в локальную базу знаний",
             str(Path.home()),
             "Документы (*.pdf *.docx *.txt *.md *.markdown)",
+            **dialog_options,
         )
         if not paths:
             return
