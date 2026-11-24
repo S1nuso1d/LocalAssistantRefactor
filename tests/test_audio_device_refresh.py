@@ -6,12 +6,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from assistant.settings_dialog import _AudioDevicesWorker
+from assistant.audio_device_discovery import AudioDevicesWorker
 
 
 class AudioDevicesWorkerTests(unittest.TestCase):
     def _run_worker(self, soundcard_module):
-        worker = _AudioDevicesWorker(soundcard_module)
+        worker = AudioDevicesWorker(soundcard_module)
         results = []
         worker.loaded.connect(
             lambda speakers, microphones, errors: results.append(
