@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from . import autostart
 from .audio_device_discovery import AudioDevicesWorker as _AudioDevicesWorker
-from .ollama_client import OllamaClient
+from .model_discovery import start_model_discovery
 from .settings_store import DEFAULT_SETTINGS, SettingsStore, normalize_ollama_url
 
 logger = logging.getLogger("live_assistant.settings")
@@ -60,19 +60,6 @@ QTabBar::tab:hover { color: white; }
 _ACTIVE_AUDIO_DEVICE_WORKERS: set[_AudioDevicesWorker] = set()
 
 
-class _ModelsWorker(QThread):
-    """Query Ollama off the UI thread so the dialog opens instantly."""
-
-    loaded = Signal(list)
-
-    def __init__(self, url: str, parent=None) -> None:
-        super().__init__(parent)
-        self._url = url
-
-    def run(self) -> None:
-        self.loaded.emit(OllamaClient.list_models(self._url))
-
-
 def _form_tab() -> tuple[QWidget, QFormLayout]:
     page = QWidget()
     form = QFormLayout(page)
@@ -87,7 +74,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self._capture_state = capture_state
-        self._worker: _ModelsWorker | None = None
+        self._worker = None
         self._audio_devices_worker: _AudioDevicesWorker | None = None
         self._audio_refresh_selection: tuple[str, str, str, str] | None = None
         self.setWindowTitle("Настройки LocalAssistant")
@@ -720,9 +707,16 @@ class SettingsDialog(QDialog):
         url = normalize_ollama_url(self.ollama_url.text()) or str(
             DEFAULT_SETTINGS["ollama_url"]
         )
-        self._worker = _ModelsWorker(url, self)
-        self._worker.loaded.connect(self._on_models_loaded)
-        self._worker.start()
+        try:
+            self._worker = start_model_discovery(
+                url, self._on_models_loaded, self._on_model_worker_finished
+            )
+        except Exception as exc:
+            self.refresh_button.setEnabled(True)
+            self.models_status.setText(
+                f"Не удалось запустить обнаружение моделей: {type(exc).__name__}"
+            )
+            logger.exception("Не удалось запустить фоновое обнаружение моделей.")
 
     def _on_models_loaded(self, models: list) -> None:
         self.refresh_button.setEnabled(True)
@@ -738,14 +732,9 @@ class SettingsDialog(QDialog):
                 "Ollama не отвечает или моделей нет — имя можно ввести вручную."
             )
 
-    def done(self, result: int) -> None:
-        # The models worker belongs to this dialog and must finish before its
-        # QObject parent is destroyed. Audio discovery is parentless and kept
-        # in a module-level registry, so it may finish safely after this dialog
-        # closes without blocking the UI.
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(3000)
-        super().done(result)
+    def _on_model_worker_finished(self) -> None:
+        self._worker = None
+
 
     # ---- actions ----------------------------------------------------
     def _reset_all(self) -> None:
