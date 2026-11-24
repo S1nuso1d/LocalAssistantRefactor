@@ -54,6 +54,38 @@ QTabBar::tab:hover { color: white; }
 """
 
 
+class _AudioDevicesWorker(QThread):
+    """Enumerate Windows audio endpoints without blocking the settings UI."""
+
+    loaded = Signal(list, list, list)
+
+    def run(self) -> None:
+        speakers: list[tuple[str, str]] = []
+        microphones: list[tuple[str, str]] = []
+        errors: list[str] = []
+        try:
+            speakers = [
+                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
+                for item in sc.all_speakers()
+                if str(getattr(item, "name", "") or "").strip()
+            ]
+        except Exception as exc:
+            logger.exception("Не удалось обновить список устройств вывода.")
+            errors.append(f"вывод: {type(exc).__name__}")
+
+        try:
+            microphones = [
+                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
+                for item in sc.all_microphones(include_loopback=False)
+                if str(getattr(item, "name", "") or "").strip()
+            ]
+        except Exception as exc:
+            logger.exception("Не удалось обновить список микрофонов.")
+            errors.append(f"микрофон: {type(exc).__name__}")
+
+        self.loaded.emit(speakers, microphones, errors)
+
+
 class _ModelsWorker(QThread):
     """Query Ollama off the UI thread so the dialog opens instantly."""
 
@@ -82,6 +114,8 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self._capture_state = capture_state
         self._worker: _ModelsWorker | None = None
+        self._audio_devices_worker: _AudioDevicesWorker | None = None
+        self._audio_refresh_selection: tuple[str, str, str, str] | None = None
         self.setWindowTitle("Настройки LocalAssistant")
         self.setMinimumWidth(520)
         self.setModal(True)
@@ -436,7 +470,13 @@ class SettingsDialog(QDialog):
             combo.blockSignals(previous_block)
 
     def _refresh_audio_devices(self, preserve_selection: bool = True) -> None:
-        """Refresh output and microphone lists without losing unsaved choices."""
+        """Refresh audio endpoints asynchronously so a slow backend cannot freeze Qt."""
+        if (
+            self._audio_devices_worker is not None
+            and self._audio_devices_worker.isRunning()
+        ):
+            return
+
         if preserve_selection and self._audio_devices_loaded:
             speaker_id, speaker_name = self._current_device_selection(self.audio_device)
             microphone_id, microphone_name = self._current_device_selection(
@@ -449,52 +489,54 @@ class SettingsDialog(QDialog):
             microphone_name = str(
                 self.settings.get("microphone_device", "По умолчанию")
             )
+        self._audio_refresh_selection = (
+            speaker_id, speaker_name, microphone_id, microphone_name
+        )
+        self.refresh_audio_devices_button.setEnabled(False)
+        self.audio_devices_status.setText("Обновляю список аудиоустройств…")
 
-        errors: list[str] = []
-        try:
-            speakers = [
-                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
-                for item in sc.all_speakers()
-                if str(getattr(item, "name", "") or "").strip()
-            ]
-        except Exception as exc:
-            logger.exception("Не удалось обновить список устройств вывода.")
-            speakers = []
-            errors.append(f"вывод: {type(exc).__name__}")
+        worker = _AudioDevicesWorker(self)
+        worker.loaded.connect(self._on_audio_devices_loaded)
+        worker.finished.connect(self._on_audio_devices_worker_finished)
+        self._audio_devices_worker = worker
+        worker.start()
 
-        try:
-            microphones = [
-                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
-                for item in sc.all_microphones(include_loopback=False)
-                if str(getattr(item, "name", "") or "").strip()
-            ]
-        except Exception as exc:
-            logger.exception("Не удалось обновить список микрофонов.")
-            microphones = []
-            errors.append(f"микрофон: {type(exc).__name__}")
+    def _on_audio_devices_loaded(
+        self,
+        speakers: list[tuple[str, str]],
+        microphones: list[tuple[str, str]],
+        errors: list[str],
+    ) -> None:
+        """Apply worker results on the GUI thread and retain the latest selection."""
+        if self._audio_devices_loaded:
+            speaker_id, speaker_name = self._current_device_selection(self.audio_device)
+            microphone_id, microphone_name = self._current_device_selection(
+                self.microphone_device
+            )
+        else:
+            (
+                speaker_id, speaker_name, microphone_id, microphone_name
+            ) = self._audio_refresh_selection or ("", "По умолчанию", "", "По умолчанию")
 
         self._populate_audio_device_combo(
-            self.audio_device,
-            speakers,
-            "Устройство по умолчанию",
-            speaker_id,
-            speaker_name,
+            self.audio_device, speakers, "Устройство по умолчанию",
+            speaker_id, speaker_name,
         )
         self._populate_audio_device_combo(
-            self.microphone_device,
-            microphones,
-            "Микрофон по умолчанию",
-            microphone_id,
-            microphone_name,
+            self.microphone_device, microphones, "Микрофон по умолчанию",
+            microphone_id, microphone_name,
         )
         self._audio_devices_loaded = True
 
-        summary = (
-            f"Вывод: {len(speakers)} · микрофоны: {len(microphones)}"
-        )
+        summary = f"Вывод: {len(speakers)} · микрофоны: {len(microphones)}"
         if errors:
             summary += " · ошибки получения: " + ", ".join(errors)
         self.audio_devices_status.setText(summary)
+
+    def _on_audio_devices_worker_finished(self) -> None:
+        self.refresh_audio_devices_button.setEnabled(True)
+        self._audio_refresh_selection = None
+
 
     def _build_speech_tab(self, tabs: QTabWidget) -> None:
         page, form = _form_tab()
@@ -717,8 +759,11 @@ class SettingsDialog(QDialog):
             )
 
     def done(self, result: int) -> None:
-        if self._worker is not None:
-            self._worker.wait(3000)
+        # QThread instances must finish before their owning dialog is destroyed.
+        # Audio endpoint enumeration is now off-thread; wait only during close.
+        for worker in (self._worker, self._audio_devices_worker):
+            if worker is not None and worker.isRunning():
+                worker.wait()
         super().done(result)
 
     # ---- actions ----------------------------------------------------
