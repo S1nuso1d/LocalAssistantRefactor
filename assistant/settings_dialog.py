@@ -86,6 +86,12 @@ class _AudioDevicesWorker(QThread):
         self.loaded.emit(speakers, microphones, errors)
 
 
+# Keep endpoint discovery threads alive independently of the dialog. A backend
+# call can stall while Windows refreshes Bluetooth/USB endpoints; closing the
+# settings window must not destroy a running QThread or block the UI.
+_ACTIVE_AUDIO_DEVICE_WORKERS: set[_AudioDevicesWorker] = set()
+
+
 class _ModelsWorker(QThread):
     """Query Ollama off the UI thread so the dialog opens instantly."""
 
@@ -495,9 +501,14 @@ class SettingsDialog(QDialog):
         self.refresh_audio_devices_button.setEnabled(False)
         self.audio_devices_status.setText("Обновляю список аудиоустройств…")
 
-        worker = _AudioDevicesWorker(self)
+        worker = _AudioDevicesWorker()
+        _ACTIVE_AUDIO_DEVICE_WORKERS.add(worker)
         worker.loaded.connect(self._on_audio_devices_loaded)
         worker.finished.connect(self._on_audio_devices_worker_finished)
+        worker.finished.connect(
+            lambda worker=worker: _ACTIVE_AUDIO_DEVICE_WORKERS.discard(worker)
+        )
+        worker.finished.connect(worker.deleteLater)
         self._audio_devices_worker = worker
         worker.start()
 
@@ -759,11 +770,12 @@ class SettingsDialog(QDialog):
             )
 
     def done(self, result: int) -> None:
-        # QThread instances must finish before their owning dialog is destroyed.
-        # Audio endpoint enumeration is now off-thread; wait only during close.
-        for worker in (self._worker, self._audio_devices_worker):
-            if worker is not None and worker.isRunning():
-                worker.wait()
+        # The models worker belongs to this dialog and must finish before its
+        # QObject parent is destroyed. Audio discovery is parentless and kept
+        # in a module-level registry, so it may finish safely after this dialog
+        # closes without blocking the UI.
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(3000)
         super().done(result)
 
     # ---- actions ----------------------------------------------------
