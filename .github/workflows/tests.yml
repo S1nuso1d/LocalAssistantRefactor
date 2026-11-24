@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install requests numpy PySide6 pypdf python-docx
+      - run: python -m pip install requests numpy PySide6 pypdf python-docx soundcard
       - run: python -m compileall -q main.py assistant tests tools
       - run: python -m unittest discover -s tests -v
 

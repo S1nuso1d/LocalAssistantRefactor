@@ -1,1 +1,0 @@
-"""LocalAssistant components."""
