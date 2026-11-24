@@ -332,6 +332,16 @@ class OllamaClientTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Ollama", msg)
 
+    def test_invalid_classifier_response_does_not_echo_private_text(self):
+        client = self.make_client(object())
+        client._post_json = lambda *_args, **_kwargs: "private spoken phrase"
+
+        with self.assertRaises(OllamaError) as ctx:
+            client.classify_ambiguous("private spoken phrase")
+
+        self.assertNotIn("private spoken phrase", str(ctx.exception))
+        self.assertIn("содержимое ответа скрыто", str(ctx.exception))
+
     def test_404_gives_pull_hint_and_options_sent(self):
         seen = {}
 
@@ -925,6 +935,7 @@ class PrivacyTests(unittest.TestCase):
         for name, needles in {
             "audio_worker.py": ("Распознано", "Ненадёжный сегмент"),
             "processor.py": ("Повтор голосовой фразы", "Решение фильтра"),
+            "ollama_client.py": ("Skipping non-JSON Ollama stream line",),
         }.items():
             source = (root / name).read_text(encoding="utf-8")
             for needle in needles:

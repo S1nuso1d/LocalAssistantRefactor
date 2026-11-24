@@ -389,15 +389,16 @@ false — обычный разговор людей между собой, ре
                 except json.JSONDecodeError:
                     continue
         if value is None:
-            raise OllamaError(
-                f"Классификатор вернул невалидный JSON: {result[:300]}"
-            )
+            # The model response may echo the recognised utterance. Do not
+            # copy it into logs or the UI when transcript logging is disabled.
+            raise OllamaError("Классификатор вернул невалидный JSON (содержимое ответа скрыто).")
         if isinstance(value, bool):
             return value
         if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
             return value.strip().lower() == "true"
         raise OllamaError(
-            f"В ответе классификатора нет корректного is_request: {result[:300]}"
+            "В ответе классификатора нет корректного is_request "
+            "(содержимое ответа скрыто)."
         )
 
     def should_answer(
@@ -461,7 +462,12 @@ false — обычный разговор людей между собой, ре
                     try:
                         event = json.loads(raw_line)
                     except json.JSONDecodeError:
-                        logger.warning("Skipping non-JSON Ollama stream line: %r", raw_line[:200])
+                        # A malformed server line can contain echoed prompts
+                        # or generated text. Log only its size, never content.
+                        logger.warning(
+                            "Skipping non-JSON Ollama stream line (%d characters).",
+                            len(raw_line),
+                        )
                         continue
                     if event.get("error"):
                         raise OllamaError(str(event["error"]))
