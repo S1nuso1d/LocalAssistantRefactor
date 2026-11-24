@@ -397,7 +397,7 @@ class SettingsDialog(QDialog):
                 )
                 tooltip = f"Устройство: {original_name}"
                 if device_id:
-                    tooltip += f"\\nID: {device_id}"
+                    tooltip += f"\nID: {device_id}"
                 combo.setItemData(index, tooltip, Qt.ItemDataRole.ToolTipRole)
 
             selected_index = combo.findData(selected_id) if selected_id else -1

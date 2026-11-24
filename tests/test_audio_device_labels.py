@@ -32,7 +32,7 @@ class AudioDeviceLabelTests(unittest.TestCase):
             ("second-id", "headphones"),
         ])
         self.assertIn("…first-id", result[0][0])
-        self.assertIn("…second-id", result[1][0])
+        self.assertTrue(result[1][0].endswith("…econd-id"))
 
     def test_colliding_short_ids_use_full_ids(self):
         result = format_device_options([
