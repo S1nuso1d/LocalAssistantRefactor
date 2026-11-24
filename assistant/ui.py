@@ -1031,6 +1031,7 @@ class AssistantWindow(QWidget):
             "microphone": "Отключён",
         }
         self._quitting = False
+        self._system_shutdown = False
         self._window_hotkey_ok = False
         self.tray: TrayController | None = None
         # State callbacks arrive from the TTS thread; the Qt signal marshals
@@ -1378,6 +1379,7 @@ class AssistantWindow(QWidget):
     def _connect_audio_signals(self, worker: AudioWorker):
         worker.phrase_detected_with_source.connect(self._on_phrase_detected)
         worker.status_changed.connect(self._update_status)
+        worker.shutdown_delayed.connect(self._on_audio_shutdown_delayed)
         worker.source_status_changed.connect(self._on_audio_source_status)
         worker.listening_changed.connect(self._update_listening)
         worker.audio_level.connect(self.waveform.set_level)
@@ -1392,6 +1394,19 @@ class AssistantWindow(QWidget):
         if status.startswith(("Недоступен:", "Выбранное устройство недоступно")):
             label = "Микрофон" if source_id == "microphone" else "Системный звук"
             self._update_status(f"{label}: {status}"[:180])
+
+    def _on_audio_shutdown_delayed(self, message: str):
+        self._update_status(str(message)[:220])
+        # A user-requested exit may otherwise look like a frozen application:
+        # reveal the window only after the worker has exceeded its grace period.
+        # During Windows logoff/shutdown the window must remain hidden.
+        if self._quitting and not self._system_shutdown:
+            if self.isMinimized():
+                self.showNormal()
+            else:
+                self.show()
+            self.raise_()
+            self.activateWindow()
 
     def _connect_signals(self):
         self._connect_audio_signals(self.audio)
@@ -2528,6 +2543,7 @@ class AssistantWindow(QWidget):
 
     def prepare_quit(self):
         """Called on Windows logoff/shutdown so closing is never refused."""
+        self._system_shutdown = True
         self._quitting = True
 
     def quit_application(self):

@@ -1,3 +1,10 @@
+## 2026.11.24-r23.11
+
+- Audio and Whisper worker joins now use short polling intervals and emit a single warning when shutdown exceeds five seconds, identifying the worker that has not exited.
+- The application keeps waiting for blocked workers rather than detaching, daemonizing or force-killing threads that may still be inside native audio/ML code.
+- During a delayed user-requested exit, the main window is shown again with a clear status message; Windows logoff/shutdown keeps the window hidden.
+- Added pure unit tests for fast shutdown, delayed shutdown reporting, continued joining and invalid timing values.
+
 ## 2026.11.24-r23.10
 
 - Made the Ollama model-discovery QThread parentless and registry-managed. Closing the settings dialog no longer relies on a fixed 3-second wait before destroying a potentially running QThread.

@@ -41,6 +41,7 @@ from .segmenter import (
     segment_is_reliable,
 )
 from .settings_store import SettingsStore
+from .thread_lifecycle import join_thread_with_warning
 
 logger = logging.getLogger("live_assistant.audio")
 
@@ -49,6 +50,8 @@ DEVICE_CHECK_SECONDS = 4.0
 RETRY_INITIAL_SECONDS = 1.0
 RETRY_MAX_SECONDS = 15.0
 MAX_PENDING_PHRASE_AGE_SECONDS = 30.0
+SHUTDOWN_JOIN_POLL_SECONDS = 0.25
+SHUTDOWN_WARNING_AFTER_SECONDS = 5.0
 SOURCE_SYSTEM = "system"
 SOURCE_MICROPHONE = "microphone"
 SOURCE_LABELS = {
@@ -76,6 +79,7 @@ class AudioWorker(QThread):
     audio_level = Signal(float)
     source_audio_level = Signal(str, float)
     segment_dropped = Signal(str)
+    shutdown_delayed = Signal(str)
 
     def __init__(self, settings_store: SettingsStore | None = None) -> None:
         super().__init__()
@@ -545,6 +549,17 @@ class AudioWorker(QThread):
             enabled.append(SOURCE_MICROPHONE)
         return enabled
 
+    def _report_slow_shutdown(self, thread_name: str, elapsed: float) -> None:
+        logger.warning(
+            "Остановка аудио задерживается: поток %s работает ещё %.1f с после запроса остановки.",
+            thread_name,
+            elapsed,
+        )
+        self.shutdown_delayed.emit(
+            f"Остановка аудио задерживается: поток «{thread_name}» ещё работает "
+            f"({elapsed:.0f} с). Безопасно ожидаю его завершения."
+        )
+
     def run(self) -> None:
         transcriber: threading.Thread | None = None
         transcriber_stop = self._transcriber_stop_event
@@ -605,14 +620,24 @@ class AudioWorker(QThread):
                 event.set()
             for thread in capture_threads:
                 if thread.is_alive():
-                    thread.join()
+                    join_thread_with_warning(
+                        thread,
+                        warning_after=SHUTDOWN_WARNING_AFTER_SECONDS,
+                        poll_interval=SHUTDOWN_JOIN_POLL_SECONDS,
+                        on_slow=self._report_slow_shutdown,
+                    )
             transcriber_stop.set()
             with self._generation_lock:
                 for event in self._source_cancel_events.values():
                     event.set()
             self._phrase_wakeup.set()
             if transcriber is not None and transcriber is not threading.current_thread():
-                transcriber.join()
+                join_thread_with_warning(
+                    transcriber,
+                    warning_after=SHUTDOWN_WARNING_AFTER_SECONDS,
+                    poll_interval=SHUTDOWN_JOIN_POLL_SECONDS,
+                    on_slow=self._report_slow_shutdown,
+                )
             with self._lifecycle_lock:
                 self._source_stop_events.clear()
                 self._capture_threads.clear()
