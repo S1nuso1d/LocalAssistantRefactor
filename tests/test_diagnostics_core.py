@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from assistant.diagnostics_core import (
+    classify_audio_source_status,
     collect_diagnostics,
     display_endpoint,
     format_diagnostic_report,
@@ -19,6 +20,19 @@ from assistant.conversation_store import ConversationStore
 
 
 class DiagnosticsCoreTests(unittest.TestCase):
+    def test_audio_status_reports_pinned_device_fallback_as_warning(self):
+        self.assertEqual(
+            classify_audio_source_status(
+                "Выбранное устройство недоступно; временно используется: Speakers"
+            ),
+            "warning",
+        )
+
+    def test_audio_status_distinguishes_connected_and_failed_sources(self):
+        self.assertEqual(classify_audio_source_status("Подключён: USB Headset"), "ok")
+        self.assertEqual(classify_audio_source_status("Недоступен: device removed"), "error")
+        self.assertEqual(classify_audio_source_status("неизвестное состояние"), "warning")
+
     def test_display_endpoint_redacts_credentials_query_and_fragment(self):
         value = display_endpoint("https://alice:secret@example.test:11434/api/chat?token=abc#private")
         self.assertEqual(value, "https://example.test:11434")

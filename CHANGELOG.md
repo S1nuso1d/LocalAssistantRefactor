@@ -1,3 +1,9 @@
+## 2026.11.24-r23.5
+
+- The Diagnostics Center now marks a missing pinned audio device that is temporarily replaced by the system default as a warning instead of reporting the source as healthy.
+- Unknown audio-source states now fail safe to a warning; only an explicit connected state is reported as healthy.
+- Added deterministic coverage for device polling, default-device changes, pinned-device removal/restoration, transient enumeration failures and retry backoff.
+
 ## 2026.11.24-r23.4
 
 - Centralized the displayed application version in the root VERSION file; source and frozen onedir builds now resolve the same metadata.

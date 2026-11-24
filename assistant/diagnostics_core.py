@@ -154,6 +154,22 @@ def probe_nvidia_gpu(timeout: float = 2.5) -> dict[str, str]:
         label = "nvidia-smi не найден" if isinstance(exc, OSError) else "тайм-аут nvidia-smi"
         return {"status": "info", "detail": label}
 
+
+
+def classify_audio_source_status(detail: str) -> str:
+    """Classify a source state conservatively for the diagnostics center.
+
+    Falling back to the default endpoint keeps capture running, but it means
+    the user's pinned device is unavailable and should not be shown as healthy.
+    Unknown states also remain warnings rather than being treated as success.
+    """
+    value = str(detail or "").strip()
+    if value.startswith(("Недоступен", "Ошибка")):
+        return "error"
+    if value.startswith("Подключён:"):
+        return "ok"
+    return "warning"
+
 def collect_diagnostics(
     settings: dict[str, Any],
     audio_status: dict[str, str],
@@ -198,12 +214,7 @@ def collect_diagnostics(
             state, detail = "info", "Отключён в настройках"
         else:
             detail = str(audio_status.get(source_id, "Состояние ещё не получено"))
-            if detail.startswith(("Недоступен", "Ошибка")):
-                state = "error"
-            elif detail.startswith(("Ожидает", "Остановлен", "Состояние ещё")):
-                state = "warning"
-            else:
-                state = "ok"
+            state = classify_audio_source_status(detail)
         rows.append({"group": "Аудио", "name": label, "status": state, "detail": detail})
     rows.extend([
         {"group": "Аудио", "name": "Прослушивание", "status": "ok" if listening else "warning", "detail": "Активно" if listening else "Приостановлено"},
