@@ -29,6 +29,7 @@ from assistant.knowledge_base import (
     KnowledgeBaseStore,
     KnowledgeCancelled,
     KnowledgeError,
+    MAX_DOCUMENT_BYTES,
     MAX_SEMANTIC_SCAN_BYTES,
     MAX_SEMANTIC_SCAN_CHUNKS,
     _pack_vector,
@@ -157,6 +158,18 @@ class KnowledgeTextTests(unittest.TestCase):
         limit = _semantic_scan_limit(large_dimensions)
         self.assertLessEqual(limit * large_dimensions * 4, MAX_SEMANTIC_SCAN_BYTES)
         self.assertGreaterEqual(limit, 1)
+
+    def test_oversized_file_is_rejected_before_reading_contents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "oversized.txt"
+            with path.open("wb") as stream:
+                stream.truncate(129)
+            with (
+                patch("assistant.knowledge_base.MAX_DOCUMENT_BYTES", 128),
+                patch.object(Path, "read_bytes", side_effect=AssertionError("file must not be read")),
+            ):
+                with self.assertRaises(KnowledgeError):
+                    extract_document(path)
 
     def test_unsupported_and_empty_files_are_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

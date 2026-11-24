@@ -142,6 +142,19 @@ def extract_document(
     if suffix not in SUPPORTED_EXTENSIONS:
         raise KnowledgeError(f"Формат {suffix or '(без расширения)'} не поддерживается.")
     try:
+        file_size = file_path.stat().st_size
+    except OSError as exc:
+        raise KnowledgeError(f"Не удалось получить сведения о файле {file_path.name}: {exc}") from exc
+    if file_size <= 0:
+        raise KnowledgeError(f"Файл {file_path.name} пустой.")
+    if file_size > MAX_DOCUMENT_BYTES:
+        raise KnowledgeError(
+            f"Файл {file_path.name} превышает ограничение {MAX_DOCUMENT_BYTES // (1024 * 1024)} МБ."
+        )
+
+    # Reject oversized files before allocating their contents. Keep the
+    # post-read check as a guard against a file that grows after stat().
+    try:
         data = file_path.read_bytes()
     except OSError as exc:
         raise KnowledgeError(f"Не удалось прочитать файл {file_path.name}: {exc}") from exc
