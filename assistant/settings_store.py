@@ -256,27 +256,49 @@ class SettingsStore:
                 for key, value in loaded.items():
                     self._values[key] = coerce_setting(key, value)
 
+    @staticmethod
+    def _copy_value(value: Any) -> Any:
+        return list(value) if isinstance(value, list) else value
+
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
             if key in self._values and self._values[key] is not None:
-                return self._values[key]
-            return default
+                return self._copy_value(self._values[key])
+            return self._copy_value(default)
 
     def all(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._values)
+            return {
+                key: self._copy_value(value)
+                for key, value in self._values.items()
+            }
 
     def update(self, values: dict[str, Any]) -> None:
         with self._lock:
+            # Persist a candidate snapshot before publishing it to live readers.
+            # A failed disk write must not leave the process on unsaved settings.
+            candidate = {
+                key: self._copy_value(value)
+                for key, value in self._values.items()
+            }
             for key, value in values.items():
-                self._values[key] = coerce_setting(key, value)
+                candidate[key] = self._copy_value(coerce_setting(key, value))
+
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(self._values, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            temporary.replace(self.path)
+            try:
+                temporary.write_text(
+                    json.dumps(candidate, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                temporary.replace(self.path)
+            except Exception:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Не удалось удалить временный файл настроек %s", temporary)
+                raise
+            self._values = candidate
 
     def reset(self) -> None:
         """Restore defaults but keep internal state such as the open dialog."""

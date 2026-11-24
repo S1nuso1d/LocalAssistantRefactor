@@ -26,6 +26,33 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(reloaded.get("answer_model"), "gemma:2b")
             self.assertEqual(reloaded.get("background_alpha"), 210)
 
+    def test_failed_settings_write_does_not_change_in_memory_values(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = SettingsStore(path)
+            store.update({"temperature": 0.7, "assistant_names": ["helper"]})
+            before = store.all()
+
+            with patch.object(Path, "replace", side_effect=PermissionError("file locked")):
+                with self.assertRaises(PermissionError):
+                    store.update({"temperature": 1.4, "assistant_names": ["changed"]})
+
+            self.assertEqual(store.all(), before)
+            self.assertEqual(SettingsStore(path).all(), before)
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
+
+    def test_settings_return_defensive_copies_of_mutable_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            names = store.get("assistant_names")
+            names.append("not-persisted")
+            snapshot = store.all()
+            snapshot["assistant_names"].clear()
+            self.assertNotIn("not-persisted", store.get("assistant_names"))
+            self.assertTrue(store.get("assistant_names"))
+
     def test_conversation_persist_and_search(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConversationStore(Path(directory) / "history.sqlite3")
