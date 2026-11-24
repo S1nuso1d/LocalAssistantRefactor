@@ -1,3 +1,10 @@
+## 2026.11.24-r23.6
+
+- Audio settings now provide an explicit refresh action, so newly connected USB, Bluetooth and 2.4 GHz endpoints can be discovered without closing the settings dialog.
+- Refreshing audio devices preserves the user's current unsaved selections and retains a missing pinned device as a visible placeholder.
+- Duplicate endpoint names are disambiguated with a short backend-ID suffix; the full ID remains available as a tooltip.
+- Added pure unit tests for stable, case-insensitive device labels and duplicate-ID collision handling.
+
 ## 2026.11.24-r23.5
 
 - The Diagnostics Center now marks a missing pinned audio device that is temporarily replaced by the system default as a warning instead of reporting the source as healthy.

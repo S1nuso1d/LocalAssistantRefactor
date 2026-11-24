@@ -237,34 +237,6 @@ class SettingsDialog(QDialog):
         form.addRow("Источник", self.system_audio_enabled)
 
         self.audio_device = QComboBox()
-        self.audio_device.addItem("Устройство по умолчанию", "")
-        try:
-            speakers = sc.all_speakers()
-        except Exception:
-            logger.exception("Не удалось получить список устройств вывода.")
-            speakers = []
-        for speaker in speakers:
-            speaker_id = str(getattr(speaker, "id", "") or "")
-            self.audio_device.addItem(speaker.name, speaker_id)
-            self.audio_device.setItemData(
-                self.audio_device.count() - 1, speaker.name, Qt.ItemDataRole.UserRole + 1
-            )
-        wanted_id = str(s.get("audio_device_id", "") or "")
-        wanted_name = str(s.get("audio_device", "По умолчанию"))
-        selected_speaker_index = self.audio_device.findData(wanted_id) if wanted_id else -1
-        if selected_speaker_index < 0 and not wanted_id and wanted_name != "По умолчанию":
-            selected_speaker_index = next(
-                (i for i in range(1, self.audio_device.count())
-                 if self.audio_device.itemText(i).casefold() == wanted_name.casefold()),
-                -1,
-            )
-        if selected_speaker_index < 0 and wanted_name != "По умолчанию":
-            self.audio_device.addItem(f"{wanted_name} (не найдено)", wanted_id)
-            selected_speaker_index = self.audio_device.count() - 1
-            self.audio_device.setItemData(
-                selected_speaker_index, wanted_name, Qt.ItemDataRole.UserRole + 1
-            )
-        self.audio_device.setCurrentIndex(max(0, selected_speaker_index))
         form.addRow("Устройство вывода", self.audio_device)
         self.audio_device.setEnabled(self.system_audio_enabled.isChecked())
         self.system_audio_enabled.toggled.connect(self.audio_device.setEnabled)
@@ -274,37 +246,21 @@ class SettingsDialog(QDialog):
         form.addRow("Дополнительный источник", self.microphone_enabled)
 
         self.microphone_device = QComboBox()
-        self.microphone_device.addItem("Микрофон по умолчанию", "")
-        try:
-            microphones = sc.all_microphones(include_loopback=False)
-        except Exception:
-            logger.exception("Не удалось получить список микрофонов.")
-            microphones = []
-        for microphone in microphones:
-            microphone_id = str(getattr(microphone, "id", "") or "")
-            self.microphone_device.addItem(microphone.name, microphone_id)
-            self.microphone_device.setItemData(
-                self.microphone_device.count() - 1, microphone.name, Qt.ItemDataRole.UserRole + 1
-            )
-        wanted_mic_id = str(s.get("microphone_device_id", "") or "")
-        wanted_mic_name = str(s.get("microphone_device", "По умолчанию"))
-        selected_mic_index = self.microphone_device.findData(wanted_mic_id) if wanted_mic_id else -1
-        if selected_mic_index < 0 and not wanted_mic_id and wanted_mic_name != "По умолчанию":
-            selected_mic_index = next(
-                (i for i in range(1, self.microphone_device.count())
-                 if self.microphone_device.itemText(i).casefold() == wanted_mic_name.casefold()),
-                -1,
-            )
-        if selected_mic_index < 0 and wanted_mic_name != "По умолчанию":
-            self.microphone_device.addItem(f"{wanted_mic_name} (не найдено)", wanted_mic_id)
-            selected_mic_index = self.microphone_device.count() - 1
-            self.microphone_device.setItemData(
-                selected_mic_index, wanted_mic_name, Qt.ItemDataRole.UserRole + 1
-            )
-        self.microphone_device.setCurrentIndex(max(0, selected_mic_index))
         form.addRow("Микрофон", self.microphone_device)
         self.microphone_device.setEnabled(self.microphone_enabled.isChecked())
         self.microphone_enabled.toggled.connect(self.microphone_device.setEnabled)
+
+        device_actions = QHBoxLayout()
+        self.refresh_audio_devices_button = QPushButton("Обновить список устройств")
+        self.audio_devices_status = QLabel("Получаю список аудиоустройств…")
+        self.audio_devices_status.setObjectName("hint")
+        self.audio_devices_status.setWordWrap(True)
+        device_actions.addWidget(self.refresh_audio_devices_button)
+        device_actions.addWidget(self.audio_devices_status, 1)
+        form.addRow("Обнаружение", device_actions)
+        self.refresh_audio_devices_button.clicked.connect(self._refresh_audio_devices)
+        self._audio_devices_loaded = False
+        self._refresh_audio_devices(preserve_selection=False)
 
         self.microphone_during_tts = QCheckBox(
             "Оставлять микрофон активным во время озвучки ассистента"
@@ -408,6 +364,128 @@ class SettingsDialog(QDialog):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(page)
         tabs.addTab(scroll, "Голос")
+
+    @staticmethod
+    def _current_device_selection(combo: QComboBox) -> tuple[str, str]:
+        index = combo.currentIndex()
+        if index <= 0:
+            return "", "По умолчанию"
+        name = combo.itemData(index, Qt.ItemDataRole.UserRole + 1)
+        return str(combo.currentData() or ""), str(name or combo.currentText())
+
+    @staticmethod
+    def _populate_audio_device_combo(
+        combo: QComboBox,
+        devices: list[tuple[str, str]],
+        default_label: str,
+        selected_id: str = "",
+        selected_name: str = "По умолчанию",
+    ) -> None:
+        from .audio_device_labels import format_device_options
+
+        previous_block = combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(default_label, "")
+            for display_name, device_id, original_name in format_device_options(devices):
+                combo.addItem(display_name, device_id)
+                index = combo.count() - 1
+                combo.setItemData(
+                    index, original_name, Qt.ItemDataRole.UserRole + 1
+                )
+                tooltip = f"Устройство: {original_name}"
+                if device_id:
+                    tooltip += f"\\nID: {device_id}"
+                combo.setItemData(index, tooltip, Qt.ItemDataRole.ToolTipRole)
+
+            selected_index = combo.findData(selected_id) if selected_id else -1
+            if selected_index < 0 and selected_name and selected_name != "По умолчанию":
+                selected_index = next(
+                    (
+                        index for index in range(1, combo.count())
+                        if str(
+                            combo.itemData(index, Qt.ItemDataRole.UserRole + 1) or ""
+                        ).casefold() == selected_name.casefold()
+                    ),
+                    -1,
+                )
+
+            if selected_index < 0 and selected_name != "По умолчанию":
+                combo.addItem(f"{selected_name} (не найдено)", selected_id)
+                selected_index = combo.count() - 1
+                combo.setItemData(
+                    selected_index, selected_name, Qt.ItemDataRole.UserRole + 1
+                )
+                combo.setItemData(
+                    selected_index,
+                    "Сохранённое устройство пока не обнаружено. "
+                    "Подключите его и обновите список.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+            combo.setCurrentIndex(max(0, selected_index))
+        finally:
+            combo.blockSignals(previous_block)
+
+    def _refresh_audio_devices(self, preserve_selection: bool = True) -> None:
+        """Refresh output and microphone lists without losing unsaved choices."""
+        if preserve_selection and self._audio_devices_loaded:
+            speaker_id, speaker_name = self._current_device_selection(self.audio_device)
+            microphone_id, microphone_name = self._current_device_selection(
+                self.microphone_device
+            )
+        else:
+            speaker_id = str(self.settings.get("audio_device_id", "") or "")
+            speaker_name = str(self.settings.get("audio_device", "По умолчанию"))
+            microphone_id = str(self.settings.get("microphone_device_id", "") or "")
+            microphone_name = str(
+                self.settings.get("microphone_device", "По умолчанию")
+            )
+
+        errors: list[str] = []
+        try:
+            speakers = [
+                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
+                for item in sc.all_speakers()
+                if str(getattr(item, "name", "") or "").strip()
+            ]
+        except Exception as exc:
+            logger.exception("Не удалось обновить список устройств вывода.")
+            speakers = []
+            errors.append(f"вывод: {type(exc).__name__}")
+
+        try:
+            microphones = [
+                (str(getattr(item, "id", "") or "").strip(), str(item.name).strip())
+                for item in sc.all_microphones(include_loopback=False)
+                if str(getattr(item, "name", "") or "").strip()
+            ]
+        except Exception as exc:
+            logger.exception("Не удалось обновить список микрофонов.")
+            microphones = []
+            errors.append(f"микрофон: {type(exc).__name__}")
+
+        self._populate_audio_device_combo(
+            self.audio_device,
+            speakers,
+            "Устройство по умолчанию",
+            speaker_id,
+            speaker_name,
+        )
+        self._populate_audio_device_combo(
+            self.microphone_device,
+            microphones,
+            "Микрофон по умолчанию",
+            microphone_id,
+            microphone_name,
+        )
+        self._audio_devices_loaded = True
+
+        summary = (
+            f"Вывод: {len(speakers)} · микрофоны: {len(microphones)}"
+        )
+        if errors:
+            summary += " · ошибки получения: " + ", ".join(errors)
+        self.audio_devices_status.setText(summary)
 
     def _build_speech_tab(self, tabs: QTabWidget) -> None:
         page, form = _form_tab()
