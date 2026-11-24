@@ -54,6 +54,26 @@ jobs:
           $version = (Get-Content VERSION -Raw).Trim()
           if ([string]::IsNullOrWhiteSpace($version)) { throw "VERSION is empty." }
           "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Create source archive
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $archive = "LocalAssistant-Source-$env:RELEASE_VERSION.zip"
+          $prefix = "LocalAssistant-$env:RELEASE_VERSION/"
+          git archive --format=zip --prefix="$prefix" HEAD --output="$archive"
+          if (!(Test-Path $archive -PathType Leaf)) { throw "Source archive was not created." }
+          $size = (Get-Item $archive).Length
+          if ($size -lt 10000) { throw "Source archive is unexpectedly small ($size bytes)." }
+          Write-Host "Created $archive ($size bytes)."
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalAssistant-Source-${{ steps.version.outputs.value }}
+          path: LocalAssistant-Source-${{ steps.version.outputs.value }}.zip
+          if-no-files-found: error
+
       - name: Build Windows application
         shell: cmd
         run: build_exe.bat
